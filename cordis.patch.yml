@@ -2,11 +2,11 @@
 # 这里的 insert 才会把插件真正插进 Cordis 图。
 #
 # 教训：只在 profile 的 cordis.patch.yml 里写
-#   - id: empty-turn-guard
-#     name: dsh-empty-turn-guard
+#   - id: turn-recovery
+#     name: dsh-turn-recovery
 # 是不够的 —— 那只是「对已有 entry 的配置覆盖层」，图里没有 entry 时它什么也不做，
 # 插件根本没被 load（2026-10-25 第一次重启就是这么静默失败的）。
 - insert:
-    - id: empty-turn-guard
-      name: dsh-empty-turn-guard
+    - id: turn-recovery
+      name: dsh-turn-recovery
       config: {}

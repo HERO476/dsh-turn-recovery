@@ -71,7 +71,7 @@ const human = (text = '再说一次') => ({ role: 'user', content: [{ type: 'tex
 /** 宿主每步注入的运行时上下文消息。 */
 const runtimeContext = () => ({ role: 'user', content: [{ type: 'text', text: 'Current runtime context…' }], source: { kind: 'runtime-context' } });
 /** 插件自己的补写消息被宿主认领后写进转录的样子（id 必须是投递时那条消息的 id）。 */
-const guardClaim = (id) => ({ id, role: 'user', content: [{ type: 'text', text: '【空回合保护 · 插件自动补发】' }], source: { kind: 'plugin:empty-turn-guard' } });
+const guardClaim = (id) => ({ id, role: 'user', content: [{ type: 'text', text: '【空回合保护 · 插件自动补发】' }], source: { kind: 'plugin:turn-recovery' } });
 /** 取最近一次投递消息的 id（认领时宿主写回的 id 就是它）。 */
 const lastSentId = (rig) => { const last = rig.sent[rig.sent.length - 1]; return last && last.message && last.message.id; };
 
@@ -79,7 +79,7 @@ const cases = [];
 const test = (title, fn) => cases.push({ title, fn });
 
 test('导出契约：name / inject', () => {
-  assert.equal(name, 'empty-turn-guard');
+  assert.equal(name, 'turn-recovery');
   assert.deepEqual(inject, ['systemPrompt']);
 });
 
@@ -87,7 +87,7 @@ test('prompt 段落：order 960 + interpolate:false + 非空文案', () => {
   const rig = makeRig();
   assert.equal(rig.sections.length, 1);
   const s = rig.sections[0];
-  assert.equal(s.name, 'empty-turn-guard');
+  assert.equal(s.name, 'turn-recovery');
   assert.equal(s.order, 960);
   assert.equal(s.interpolate, false);
   assert.ok(s.text.length > 100, 'section text too short: ' + s.text.length);
@@ -107,7 +107,7 @@ test('零宽空回合（completed）→ 补写一次，走 send(next-turn, wakeu
   assert.equal(rig.sent[0].wakeup, true);
   assert.ok(rig.sent[0].text.includes('空回合保护'));
   // 补写消息必须带可辨识来源，且不能自称普通用户输入后要求隐瞒。
-  assert.equal(rig.sent[0].message.source.kind, 'plugin:empty-turn-guard');
+  assert.equal(rig.sent[0].message.source.kind, 'plugin:turn-recovery');
   assert.ok(!rig.sent[0].text.includes('不要提及'));
   assert.match(rig.log(), /empty=true/);
   assert.match(rig.log(), /nudge DELIVERED via send/);

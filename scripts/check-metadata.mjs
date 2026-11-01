@@ -64,7 +64,7 @@ try {
 
 try {
   const entry = await import(new URL('../' + pkg.main, import.meta.url));
-  if (entry.name !== 'empty-turn-guard') fail('运行时导出的 name 不是 empty-turn-guard：' + entry.name);
+  if (entry.name !== 'turn-recovery') fail('运行时导出的 name 不是 turn-recovery：' + entry.name);
   if (typeof entry.apply !== 'function') fail('运行时缺少 apply 函数');
   if (!Array.isArray(entry.inject)) fail('运行时缺少 inject 数组');
 } catch (err) {

@@ -1,4 +1,6 @@
-# dsh-empty-turn-guard
+# dsh-turn-recovery
+
+> 原名 `dsh-empty-turn-guard`，自 0.2.0 起更名。旧名在 npm 仍可访问但已弃用。
 
 给 [DeepSeek Harness](https://www.npmjs.com/package/@deepseek-ai/dsh) 用的**空回合保护**插件：当模型把输出预算全烧在 reasoning 上、回合结束时没有任何看得见的正文时，自动补一条 next-turn 消息让它把结论写出来；同时往系统提示注入一条「每回合必须以可见正文收尾」的规则。
 
@@ -13,9 +15,9 @@
 ## 行为
 
 1. **检测**：累计本回合所有 `assistant/message` 的 text 块，剥掉不可见字符后 trim。不可见集合用 Unicode 属性 `\p{Default_Ignorable_Code_Point}`（覆盖 `U+00AD / U+034F / U+061C / U+115F / U+1160 / U+17B4 / U+17B5 / U+180B–U+180E / U+200B–U+200F / U+202A–U+202E / U+2060–U+206F / U+FE00–U+FE0F / U+FEFF / U+E0001 / U+E0020–U+E007F / U+E0100–U+E01EF / U+1D173–U+1D17A` 等全部「默认可忽略」码位），再补三个渲染为空的填充符 `U+2800 / U+3164 / U+FFA0` 与行段分隔符 `U+2028 / U+2029`。`turn/end` 时若「可见字符数 < minVisibleChars 且 reason.kind === 'completed'」，判定为空回合 —— **没有任何 assistant 消息的 completed 回合也算空**（0 < 1）。助手消息含图片/文件/音视频附件时该回合不算空（界面上不是空白）；用户消息里的附件不计入这个判定。
-2. **补写**：延迟 `delayMs` 后通过 `agent.send(msg, 'next-turn', true)` 排一条 `plugin:empty-turn-guard` 来源的消息，让模型在下一回合补结论；`send` 抛错时降级到 `agent.followup(msg)`（与前者等价，都是唤醒并开新回合）。**不再使用 `agent.inject`**：它是 `send(msg, 'next-step', false)`，不唤醒，消息只会躺在队列里，旧版据此记 `DELIVERED` 属于假成功。消息正文明确写出「插件自动补发」，不自称普通用户输入。投递成功后只记「在途」并保存消息 id；只有宿主持久转录里出现该来源的 `user/message`（被认领）时，随后的回合才被视为补写回合。投递成功但 120 秒内未被认领视为过期，不阻塞下一次补写；上一笔补写未被认领前不会再排第二笔。
-3. **收尾指令**：注册一段 system prompt（name `empty-turn-guard`，order 960，`interpolate: false`），要求每回合以看得见的正文结束、禁止用零宽字符/空白/空行充当回答。
-4. **防误伤**：同一回合最多补一次；补写回合再空则停止连环；每会话每小时最多 `maxNudgesPerHour` 次（按**投递成功**计，取消/失败不占额度）；定时器未触发前收到**有人说话**的消息（真人、子代理回报、微信/社交桥）立即取消，宿主的背景注入（`runtime-context` / `time-context` / `skill-catalog` / `dsh-mnemon` / `agent-instructions` / `ptc-mode` / `model-selection` / `session-reference` / `skill-invocation` / `compact-checkpoint` / `plugin:*`）不算；新回合自己起来时丢弃过期补写；`plugin:empty-turn-guard` 来源的消息不参与判定；插件在回合中途加载（没见过 `turn/start`）时不判定该回合。
+2. **补写**：延迟 `delayMs` 后通过 `agent.send(msg, 'next-turn', true)` 排一条 `plugin:turn-recovery` 来源的消息，让模型在下一回合补结论；`send` 抛错时降级到 `agent.followup(msg)`（与前者等价，都是唤醒并开新回合）。**不再使用 `agent.inject`**：它是 `send(msg, 'next-step', false)`，不唤醒，消息只会躺在队列里，旧版据此记 `DELIVERED` 属于假成功。消息正文明确写出「插件自动补发」，不自称普通用户输入。投递成功后只记「在途」并保存消息 id；只有宿主持久转录里出现该来源的 `user/message`（被认领）时，随后的回合才被视为补写回合。投递成功但 120 秒内未被认领视为过期，不阻塞下一次补写；上一笔补写未被认领前不会再排第二笔。
+3. **收尾指令**：注册一段 system prompt（name `turn-recovery`，order 960，`interpolate: false`），要求每回合以看得见的正文结束、禁止用零宽字符/空白/空行充当回答。
+4. **防误伤**：同一回合最多补一次；补写回合再空则停止连环；每会话每小时最多 `maxNudgesPerHour` 次（按**投递成功**计，取消/失败不占额度）；定时器未触发前收到**有人说话**的消息（真人、子代理回报、微信/社交桥）立即取消，宿主的背景注入（`runtime-context` / `time-context` / `skill-catalog` / `dsh-mnemon` / `agent-instructions` / `ptc-mode` / `model-selection` / `session-reference` / `skill-invocation` / `compact-checkpoint` / `plugin:*`）不算；新回合自己起来时丢弃过期补写；`plugin:turn-recovery` 来源的消息不参与判定；插件在回合中途加载（没见过 `turn/start`）时不判定该回合。
 
 非 `completed` 的回合（`interrupted` / `error` / `aborted` / `max-tokens` / `blocked`）一律不补写。
 
@@ -29,13 +31,13 @@
 // <DSH_HOME>/profiles/<你的 profile>/package.json
 {
   "dependencies": {
-    "dsh-empty-turn-guard": "^0.1.0"
+    "dsh-turn-recovery": "^0.2.0"
   },
   "dsh": {
     "profile": {
       "bundles": [
         // …其他 bundle
-        "dsh-empty-turn-guard"
+        "dsh-turn-recovery"
       ]
     }
   }
@@ -51,8 +53,8 @@
 在 profile 的 `cordis.patch.yml` 里覆盖默认值：
 
 ```yaml
-- id: empty-turn-guard
-  name: dsh-empty-turn-guard
+- id: turn-recovery
+  name: dsh-turn-recovery
   config:
     enabled: true            # false = 只保留收尾指令，不补写（字符串 "false" 也认）
     injectInstruction: true  # false = 不注入 system prompt 段落
@@ -61,14 +63,14 @@
     delayMs: 900             # 补写前等待（毫秒，0–60000，非法值回落 900）
     maxNudgesPerHour: 3      # 每会话每小时的补写上限（0 = 关闭补写）
     sessionScope: root       # root = 只处理根会话（session-*）；all = 连子代理/社交桥会话一起
-    logFile: ''              # 空 = <DSH_HOME>/logs/empty-turn-guard.log
+    logFile: ''              # 空 = <DSH_HOME>/logs/turn-recovery.log
 ```
 
 配置做严格解析：`maxNudgesPerHour: 0` 是**关闭补写**，不会被默认值吞成 3；`delayMs: "abc"` 这类非法值回落到默认值；`enabled: "false"`（字符串）与 `false` 等价。
 
 ## 日志
 
-默认写到 `<DSH_HOME>/logs/empty-turn-guard.log`（未设 `DSH_HOME` 时是 `~/.dsh/logs/…`；主路径不可写时兜底到系统临时目录；超过 5 MB 自动轮转为 `.1`）：
+默认写到 `<DSH_HOME>/logs/turn-recovery.log`（未设 `DSH_HOME` 时是 `~/.dsh/logs/…`；主路径不可写时兜底到系统临时目录；超过 5 MB 自动轮转为 `.1`）：
 
 ```
 [2026-10-25T01:49:13.941Z] plugin activated: pid=17520 enabled=true instruction=true dshHome=C:\Users\me\.dsh
@@ -98,7 +100,7 @@
 
 ## 已知限制
 
-- **补写消息以 `role: 'user'` 落盘**（`source.kind = 'plugin:empty-turn-guard'`）：宿主 session 层对 `source.kind` 不做枚举校验，插件侧也改不了 role。桌面前端按 `source.kind !== 'user'` 渲染成上下文卡片（不是用户气泡），mnemon 只收录 `source.kind === 'user'`，所以界面与记忆都不受污染；但**会话转录文件里它确实是一条 user 消息**，审计时要看 `source.kind` 区分。
+- **补写消息以 `role: 'user'` 落盘**（`source.kind = 'plugin:turn-recovery'`）：宿主 session 层对 `source.kind` 不做枚举校验，插件侧也改不了 role。桌面前端按 `source.kind !== 'user'` 渲染成上下文卡片（不是用户气泡），mnemon 只收录 `source.kind === 'user'`，所以界面与记忆都不受污染；但**会话转录文件里它确实是一条 user 消息**，审计时要看 `source.kind` 区分。
 - **用户点停止的窗口**：宿主 `cancel()` 只清 inbox + abort，不 append 任何 session 事件。插件订阅了宿主 dispatch 的 `agent/inbox/discarded` 来撤掉自己那条补写，但该事件是否向插件广播取决于宿主的 dispatch 链路；收不到时，「用户已点停止、插件仍在 `delayMs` 后补写」这个窗口依然存在（默认 900ms，可通过 `delayMs` 调小）。真正发出去的那一回合仍受宿主 abort 语义约束。
 - **`sessionScope: 'root'` 的判定依据是 id 前缀 `session-`**：老版本（v3 日志）的纯 UUID 会话目录、`social-*` 社交桥会话都算「非根」，默认不处理。被过滤的会话每个 id 只记一条 `skip scope` 日志，不会静默消失。
 - **崩溃遗留**：补写已入队但宿主在认领前崩溃时，该消息可能在下次启动被重放。插件只认 id 匹配的认领（`NOT ours`），因此不会被这种消息骗成「补写回合」，但它仍可能作为一条插件消息出现在转录里。

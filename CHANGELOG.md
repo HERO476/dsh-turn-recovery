@@ -1,9 +1,35 @@
 # Changelog
 
-本文件记录 dsh-empty-turn-guard 的所有重要变更，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
+本文件记录 dsh-turn-recovery 的所有重要变更，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [0.1.6] - 2026-10-30
+> **改名说明（0.2.0）**：本插件原名 `dsh-empty-turn-guard`，因与另外两个同名项目（`FYTXY/dsh-empty-turn-guard`、
+> `@nlflora/dsh-empty-turn-guard`）冲突，自 0.2.0 起更名为 `dsh-turn-recovery`。0.1.x 及更早的条目保留旧名原文，
+> 其提到的 `plugin:empty-turn-guard`、`empty-turn-guard.log` 等标识在 0.2.0 起分别改为 `plugin:turn-recovery`、`turn-recovery.log`。
+
+## [0.2.0] - 2026-11-01
+
+**更名发布**，功能与 0.1.6 完全一致，不含行为变化。
+
+### 变更
+
+- npm 包名 `dsh-empty-turn-guard` → **`dsh-turn-recovery`**；GitHub 仓库同步更名。
+- 运行时插件 id `empty-turn-guard` → **`turn-recovery`**（`export const name`、`dsh.bundle.patch` 的 `- id:`、profile 里覆盖用的 `- id:` 全部随之改变）。
+- 补写消息来源 `plugin:empty-turn-guard` → **`plugin:turn-recovery`**。
+- 系统提示段落名 `empty-turn-guard` → **`turn-recovery`**（`order` 仍为 960）。
+- 日志文件名 `empty-turn-guard.log` → **`turn-recovery.log`**。
+- 版本号从 0.1.6 跳到 0.2.0：包名与插件 id 都是破坏性变更（旧的 profile 注册与 `node_modules` 链接必须更新，否则宿主会静默跳过该 bundle），按语义化版本应当断代。
+
+### 升级须知
+
+从 0.1.x 升级需要同时改三处，缺一处宿主要么静默不加载、要么加载旧目录：
+
+1. profile 的 `dependencies` 与 `dsh.profile.bundles` 里的包名；
+2. profile 的 `cordis.patch.yml` 里 `- id: empty-turn-guard` → `- id: turn-recovery`（配置内容不变）；
+3. `node_modules` 里的包链接（junction）需要重建为新包名。
+
+旧日志文件 `~/.dsh/logs/empty-turn-guard.log` 不会自动改名，可以保留作历史，也可以直接删除。
+
 
 修复第四轮复核（DSH `0.2.1-rc.5`）确认的两个**独立状态机缺陷**，以及用户点停止不可观察、
 日志/配置层面的若干小问题。`lib/index.js` 的判定口径没变，改的都是「状态什么时候被清/被置」。

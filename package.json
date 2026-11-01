@@ -1,17 +1,17 @@
 {
-  "name": "dsh-empty-turn-guard",
-  "version": "0.1.6",
+  "name": "dsh-turn-recovery",
+  "version": "0.2.0",
   "description": "DSH plugin: detect assistant turns that end with no visible text (zero-width placeholder) and re-prompt the model to write the answer; also injects a visible-closing-answer system prompt rule.",
   "license": "MIT",
   "author": "HERO476",
   "type": "module",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/HERO476/dsh-empty-turn-guard.git"
+    "url": "git+https://github.com/HERO476/dsh-turn-recovery.git"
   },
-  "homepage": "https://github.com/HERO476/dsh-empty-turn-guard#readme",
+  "homepage": "https://github.com/HERO476/dsh-turn-recovery#readme",
   "bugs": {
-    "url": "https://github.com/HERO476/dsh-empty-turn-guard/issues"
+    "url": "https://github.com/HERO476/dsh-turn-recovery/issues"
   },
   "main": "./lib/index.js",
   "exports": {
