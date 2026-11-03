@@ -34,6 +34,17 @@ if (pkg.exports && pkg.exports['.'] && norm(pkg.exports['.']) !== norm(pkg.main)
 if (pkg.exports && !pkg.exports['./cordis.patch.yml']) fail("缺少 exports['./cordis.patch.yml']");
 if (!pkg.engines || !pkg.engines.node) fail('缺少 engines.node');
 if (!pkg.engines || !pkg.engines.dsh) fail('缺少 engines.dsh');
+// 上界必须是显式的预发布截断（x.y.z-0）。宿主用 semver 的 includePrerelease:true
+// 解析 engines.dsh，写成 "<0.3.0" 时 0.3.0-alpha.1 / 0.3.0-beta.2 都会被判定满足，
+// 结果是插件在还没适配的主线版本上照常加载。实测：semver.satisfies('0.3.0-alpha.1',
+// '>=0.2.1-rc.1 <0.3.0', {includePrerelease:true}) === true。
+if (pkg.engines && typeof pkg.engines.dsh === 'string') {
+  const upper = pkg.engines.dsh.split('<')[1];
+  if (upper === undefined) fail('engines.dsh 缺少上界（会一路放行到未来版本）');
+  else if (!/^\d+\.\d+\.\d+-0$/.test(upper.trim())) {
+    fail('engines.dsh 上界必须写成 x.y.z-0（含预发布截断），实际：' + upper.trim());
+  }
+}
 if (!pkg.publishConfig || pkg.publishConfig.access !== 'public') fail("缺少 publishConfig.access = 'public'");
 if (!Array.isArray(pkg.files) || pkg.files.length === 0) fail('缺少 files 白名单');
 if (!pkg.scripts || !pkg.scripts.test) fail('缺少 scripts.test');

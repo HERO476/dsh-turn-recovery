@@ -7,6 +7,61 @@
 > `@nlflora/dsh-empty-turn-guard`）冲突，自 0.2.0 起更名为 `dsh-turn-recovery`。0.1.x 及更早的条目保留旧名原文，
 > 其提到的 `plugin:empty-turn-guard`、`empty-turn-guard.log` 等标识在 0.2.0 起分别改为 `plugin:turn-recovery`、`turn-recovery.log`。
 
+## [0.2.1] - 2026-11-03
+
+**适配性修复**：针对 DSH `0.2.2-alpha.3` 实测（宿主 `dsh-session` / `dsh-agent-loop` /
+`dsh-system-prompt` / `dsh-app-boot` 源码取证 + 本机 37 个会话日志复核）。不含新功能，
+但有三处行为变化，升级前请读。
+
+### 修复
+
+- **会话范围改按 `SessionHeader` 判定**（原 `lib/index.js` 用 `/^session-/` 猜 id 前缀）：
+  只有 `header.origin === 'subagent'` 或 `header.delegationDepth > 0` 才算子代理会话。
+  0.2.0 把 `orchestrator-*` 这类顶层会话全部当成子代理过滤掉，实测日志里有 19 条
+  `skip scope: non-root session orchestrator` —— 通过路由器（orchestrator 会话）跑的
+  主对话从来没被保护过。宿主没有 header 时（老宿主 / 测试桩）退回 id 形态判定。
+- **取消策略由「后台黑名单」改为「前台白名单」**：默认只有 `source.kind === 'user'`
+  与 `'agent-message'` 会取消待发补写，且 `source.form === 'notice'` 永远不取消。
+  0.2.0 的黑名单没收录宿主后来新增的 `tool-jobs` / `action-cards` / `plan-mode` /
+  `tool-goal`（都是 `form: "notice"`）与 `goal` / `schedule` 自动化来源，它们会让
+  已排好的补写被静默取消。未知来源现在一律按后台处理，漏取消由 `turn/start`
+  分支兜底；自定义桥接可继续用 `foregroundKinds` 加回取消语义。
+- **prompt 段落注册失败改为 fail-closed**：宿主对同名 section 重复注册会直接 throw
+  （同一插件被两个 bundle 各装一次就会这样）。旧版 catch 之后仍打印 `guard armed`，
+  于是「222 字符收尾指令其实没进 prompt」在日志里看不出来，且两个实例会各发一条补写。
+  现在记 `guard NOT armed (fail-closed: ...)` 并整体不启用。
+- **投放前查宿主队列去重**：`nudgeMessageId` 是进程内记忆，重启 / 热重载 / 双实例时为空。
+  投递前检查 `agent.inbox.nextTurn` 里是否已有 `plugin:turn-recovery` 来源的待认领消息，
+  有则跳过，避免同一个空回合被连投两笔。
+- **小时预算跨重启生效**：投递时刻追加到 `$DSH_HOME/state/turn-recovery/nudges.log`，
+  进程启动后首次见到某会话时回读最近一小时。旧版的 `nudgeTimes` 只在内存里，重启即清零，
+  同一会话每次重启都能重新领满额度。
+- **`engines.dsh` 上界收紧为 `<0.3.0-0`**：宿主用 `semver` 的 `includePrerelease: true`
+  判定门槛，`<0.3.0` 会放行 `0.3.0-alpha.1` / `0.3.0-beta.2`（实测为 true）。`-0` 是显式的
+  预发布截断。`scripts/check-metadata.mjs` 新增规则强制上界必须写成 `x.y.z-0`。
+- **日志可读性**：`guard armed` 现在带 `instruction=registered|disabled`；`skip scope`
+  带上判定依据（`header says subagent` / `id is not a root shape`）；`tag()` 同时剥掉
+  `orchestrator-` 前缀（否则所有 orchestrator 会话在日志里都显示成 `[orchestr]`）。
+- **日志行内的换行被压平**：会话 id、错误文本里带 `\n` 时可以伪造出一行看似插件自己
+  写的记录（例如假的 `guard armed` 或 `turn/end`），现在一律替换为空格。
+
+### 新增配置
+
+- `foregroundKinds: string[]`：追加「会取消待发补写」的来源 `kind`（默认 `user` / `agent-message`）。
+- `budgetFile: string`：补写预算的持久化路径（默认 `$DSH_HOME/state/turn-recovery/nudges.log`）。
+
+### 已知边界（不变，仅补文档）
+
+- 可见字符按**回合累计**而非末条消息计：先写结论、后被工具调用打断的回合不算空。
+- 非 `completed` 回合（`aborted` / `interrupted` / `error` / `max-tokens` / `blocked`）一律不补写。
+- `minVisibleChars` 默认 1 是刻意取最小阈值；要「短于 N 字也算空」可自行调高。
+
+### 验证
+
+- `node test/guard.test.mjs`：43 个用例全通过（新增 9 个：header 判根、notice 不取消、
+  前台白名单、`fail-closed`、inbox 去重、跨重启限流、预算落盘、`foregroundKinds`、日志压平）。
+- `node scripts/check-metadata.mjs`：通过；负向验证把上界改回 `<0.3.0` 会失败。
+
 ## [0.2.0] - 2026-11-01
 
 **更名发布**，功能与 0.1.6 完全一致，不含行为变化。

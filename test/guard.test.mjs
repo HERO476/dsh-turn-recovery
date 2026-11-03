@@ -27,19 +27,32 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 let seq = 0;
 function makeRig(config = {}, registryAgents = []) {
-  const logFile = path.join(os.tmpdir(), 'etg-test-' + process.pid + '-' + (++seq) + '.log');
+  const id = ++seq;
+  const logFile = path.join(os.tmpdir(), 'etg-test-' + process.pid + '-' + id + '.log');
+  // 预算文件也隔离到 tmp：默认路径在 $DSH_HOME/state 下，测试写进去会污染真实环境，
+  // 而且跨测试运行共用同一份记录会让「小时预算」用例变得不稳定。
+  const budgetFile = path.join(os.tmpdir(), 'etg-budget-' + process.pid + '-' + id + '.log');
   const sections = [];
   const handlers = new Map();
   const effects = [];
   const sent = [];
   const ctx = {
-    systemPrompt: { section: (opts) => { sections.push(opts); return () => {}; } },
+    systemPrompt: {
+      section: (opts) => {
+        if (config.__sectionThrows) throw new Error(config.__sectionThrows);
+        sections.push(opts);
+        return () => {};
+      },
+    },
     on: (event, fn) => { handlers.set(event, fn); },
     effect: (fn) => { effects.push(fn); },
     get: (service) => (service === 'agents' ? { list: () => registryAgents } : undefined),
   };
-  apply(ctx, { delayMs: 5, logFile, maxNudgesPerHour: 3, ...config });
-  const session = { id: 'session-' + (1000 + seq) };
+  apply(ctx, { delayMs: 5, logFile, budgetFile, maxNudgesPerHour: 3, ...config });
+  const session = {
+    id: config.__sessionId || ('session-' + (1000 + id)),
+    ...(config.__header ? { header: config.__header } : {}),
+  };
   const agent = {
     session,
     send(message, target, wakeup) { sent.push({ via: 'send', target, wakeup, text: message.content[0].text, message }); },
@@ -53,8 +66,11 @@ function makeRig(config = {}, registryAgents = []) {
     fn(session, { type, data, seq: ++seq, time: Date.now() });
   };
   const log = () => { try { return fs.readFileSync(logFile, 'utf8'); } catch { return ''; } };
-  const cleanup = () => { try { fs.rmSync(logFile, { force: true }); } catch {} };
-  return { ctx, sections, handlers, effects, sent, session, agent, fire, log, cleanup };
+  const cleanup = () => {
+    try { fs.rmSync(logFile, { force: true }); } catch {}
+    try { fs.rmSync(budgetFile, { force: true }); } catch {}
+  };
+  return { ctx, sections, handlers, effects, sent, session, agent, fire, log, cleanup, budgetFile };
 }
 
 const assistant = (text, tool = false) => ({
@@ -391,8 +407,8 @@ test('会话范围：默认只处理根会话（session-*），子代理裸 UUID
   all.cleanup();
 });
 
-test('后台注入（time-context / skill-catalog / dsh-mnemon / agent-instructions / ptc-mode / model-selection / session-reference / skill-invocation / compact-checkpoint）不取消补写；社交桥会取消', async () => {
-  for (const kind of [
+test('后台来源不取消补写：自动上下文 / notice / 自动化回合（0.2.0 会误取消的那批）', async () => {
+  const kinds = [
     'time-context',
     'skill-catalog',
     'dsh-mnemon',
@@ -403,7 +419,17 @@ test('后台注入（time-context / skill-catalog / dsh-mnemon / agent-instructi
     'skill-invocation',
     'compact-checkpoint',
     'plugin:other',
-  ]) {
+    // 0.2.0 的 BACKGROUND_KINDS 没收录、于是被当成真人插话的宿主来源：
+    'tool-jobs',
+    'action-cards',
+    'plan-mode',
+    'tool-goal',
+    'subagent-settled',
+    'goal',
+    'schedule',
+    'runtime-context',
+  ];
+  for (const kind of kinds) {
     const rig = makeRig({ delayMs: 60 });
     rig.fire('turn/start', { turn: 55 });
     rig.fire('assistant/message', { turn: 55, step: 1, message: assistant(ZW) });
@@ -411,17 +437,53 @@ test('后台注入（time-context / skill-catalog / dsh-mnemon / agent-instructi
     rig.fire('user/message', { role: 'user', content: [{ type: 'text', text: 'bg' }], source: { kind } });
     await sleep(120);
     assert.equal(rig.sent.length, 1, kind + ' must not cancel the nudge');
+    assert.doesNotMatch(rig.log(), /CANCELLED/, kind + ' should not cancel');
+    rig.cleanup();
+  }
+});
+
+test('form:"notice" 的来源即使 kind 看着像真人也不取消（宿主通知形态）', async () => {
+  const rig = makeRig({ delayMs: 60 });
+  rig.fire('turn/start', { turn: 57 });
+  rig.fire('assistant/message', { turn: 57, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 57, reason: { kind: 'completed' } });
+  rig.fire('user/message', { role: 'user', content: [{ type: 'text', text: 'n' }], source: { kind: 'user', form: 'notice' } });
+  await sleep(120);
+  assert.equal(rig.sent.length, 1, 'notice-form message is a host notice, not a person');
+  rig.cleanup();
+});
+
+test('真人 / agent-message 仍会取消待发补写；未知来源默认按后台（不取消）', async () => {
+  for (const kind of ['user', 'agent-message']) {
+    const rig = makeRig({ delayMs: 60 });
+    rig.fire('turn/start', { turn: 58 });
+    rig.fire('assistant/message', { turn: 58, step: 1, message: assistant(ZW) });
+    rig.fire('turn/end', { turn: 58, reason: { kind: 'completed' } });
+    rig.fire('user/message', { role: 'user', content: [{ type: 'text', text: 'hi' }], source: { kind } });
+    await sleep(120);
+    assert.equal(rig.sent.length, 0, kind + ' must cancel the pending nudge');
+    assert.ok(rig.log().includes('CANCELLED (user message (' + kind + '))'));
     rig.cleanup();
   }
 
   const rig = makeRig({ delayMs: 60 });
-  rig.fire('turn/start', { turn: 56 });
-  rig.fire('assistant/message', { turn: 56, step: 1, message: assistant(ZW) });
-  rig.fire('turn/end', { turn: 56, reason: { kind: 'completed' } });
+  rig.fire('turn/start', { turn: 59 });
+  rig.fire('assistant/message', { turn: 59, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 59, reason: { kind: 'completed' } });
+  rig.fire('user/message', { role: 'user', content: [{ type: 'text', text: 'x' }], source: { kind: 'some-bridge-we-never-saw' } });
+  await sleep(120);
+  assert.equal(rig.sent.length, 1, 'unknown source kinds default to background');
+  rig.cleanup();
+});
+
+test('foregroundKinds 配置可以把自定义桥接加回取消语义', async () => {
+  const rig = makeRig({ delayMs: 60, foregroundKinds: ['wechat-social-bridge'] });
+  rig.fire('turn/start', { turn: 61 });
+  rig.fire('assistant/message', { turn: 61, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 61, reason: { kind: 'completed' } });
   rig.fire('user/message', { role: 'user', content: [{ type: 'text', text: 'hi' }], source: { kind: 'wechat-social-bridge' } });
   await sleep(120);
-  assert.equal(rig.sent.length, 0, 'social bridge message is real activity -> cancel');
-  assert.ok(rig.log().includes('wechat-social-bridge'));
+  assert.equal(rig.sent.length, 0, 'configured foreground kind must cancel');
   rig.cleanup();
 });
 
@@ -590,6 +652,101 @@ test('激活日志带版本号，过滤范围外的会话留下一条 skip scope
 test('自定义收尾指令超长时截断到 4000 字符（避免长期抬高每回合输入）', () => {
   const rig = makeRig({ instructionText: 'x'.repeat(9000) });
   assert.equal(rig.sections[0].text.length, 4000);
+  rig.cleanup();
+});
+
+test('会话范围改按 SessionHeader 判定：orchestrator-* 是根会话，origin:subagent 才是子代理', async () => {
+  // 0.2.0 用 /^session-/ 猜 id，把所有 orchestrator-* 会话当成子代理静默跳过。
+  const rig = makeRig({
+    __sessionId: 'orchestrator-31d11c4854ad57766e4928184b43fed7',
+    __header: { version: 4, id: 'orchestrator-31d11c4854ad57766e4928184b43fed7', createdAt: 1, isSeeded: false, delegationDepth: 0 },
+  });
+  rig.fire('turn/start', { turn: 70 });
+  rig.fire('assistant/message', { turn: 70, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 70, reason: { kind: 'completed' } });
+  await sleep(60);
+  assert.equal(rig.sent.length, 1, 'top-level orchestrator session must be in scope');
+  assert.doesNotMatch(rig.log(), /skip scope/);
+  rig.cleanup();
+
+  // 反过来：id 长得像根会话，但 header 说是子代理 → 跳过。
+  const child = makeRig({
+    __sessionId: 'session-99999999-0000-0000-0000-000000000000',
+    __header: { version: 4, id: 'session-99999999-0000-0000-0000-000000000000', createdAt: 1, isSeeded: false, origin: 'subagent', delegationDepth: 1 },
+  });
+  child.fire('turn/start', { turn: 71 });
+  child.fire('assistant/message', { turn: 71, step: 1, message: assistant(ZW) });
+  child.fire('turn/end', { turn: 71, reason: { kind: 'completed' } });
+  await sleep(60);
+  assert.equal(child.sent.length, 0, 'header origin:subagent must be skipped even with a session- id');
+  assert.match(child.log(), /skip scope: non-root session session-9999.*header says subagent/);
+  child.cleanup();
+});
+
+test('prompt 段落注册失败 → fail-closed：不启用补写，日志不再谎报 guard armed', async () => {
+  const rig = makeRig({ __sectionThrows: 'section "turn-recovery" already registered', delayMs: 5 });
+  // fail-closed 的实现是「注册失败就 return」，因此连 session/event 都不订阅：
+  // 这里不能 fire 事件，否则测试桩自身会抛「插件未订阅」。
+  assert.equal(rig.handlers.has('session/event'), false, 'fail-closed must not arm the guard loop');
+  await sleep(20);
+  assert.equal(rig.sent.length, 0, 'guard must not arm when its instruction section failed');
+  const log = rig.log();
+  assert.match(log, /prompt section registration FAILED/);
+  assert.match(log, /guard NOT armed \(fail-closed/);
+  assert.doesNotMatch(log, /guard armed/);
+  rig.cleanup();
+});
+
+test('inbox 里已有一笔未认领的补写 → 不再投第二笔（跨进程/双实例去重）', async () => {
+  const rig = makeRig({ delayMs: 5 });
+  // 模拟「另一个实例已经投递、内存标记却丢了」：队列里躺着一笔本插件的补写。
+  rig.agent.inbox = { nextTurn: [{ id: 'from-other-process', source: { kind: 'plugin:turn-recovery' } }], nextStep: [] };
+  rig.fire('turn/start', { turn: 73 });
+  rig.fire('assistant/message', { turn: 73, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 73, reason: { kind: 'completed' } });
+  await sleep(60);
+  assert.equal(rig.sent.length, 0, 'a queued nudge already covers this empty turn');
+  assert.match(rig.log(), /inbox already holds a pending turn-recovery nudge/);
+  rig.cleanup();
+});
+
+test('跨重启限流：持久化文件里的投递记录也计入小时预算', async () => {
+  const rig = makeRig({ delayMs: 5, maxNudgesPerHour: 2 });
+  const id = rig.session.id;
+  const now = Date.now();
+  // 直接写进该 rig 的预算文件：两条「最近一小时」的记录 = 预算已用尽。
+  fs.writeFileSync(rig.budgetFile, id + ' ' + (now - 1000) + '\n' + id + ' ' + (now - 2000) + '\n');
+  rig.fire('turn/start', { turn: 74 });
+  rig.fire('assistant/message', { turn: 74, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 74, reason: { kind: 'completed' } });
+  await sleep(60);
+  assert.equal(rig.sent.length, 0, 'persisted nudges must consume the hourly budget after a restart');
+  assert.match(rig.log(), /hourly nudge budget exhausted/);
+  rig.cleanup();
+});
+
+test('投递成功会写进持久化预算文件（供重启后的进程回读）', async () => {
+  const rig = makeRig({ delayMs: 5 });
+  rig.fire('turn/start', { turn: 75 });
+  rig.fire('assistant/message', { turn: 75, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 75, reason: { kind: 'completed' } });
+  await sleep(60);
+  assert.equal(rig.sent.length, 1);
+  const raw = fs.readFileSync(rig.budgetFile, 'utf8');
+  assert.ok(raw.includes(rig.session.id), 'budget file should record the session id');
+  rig.cleanup();
+});
+
+test('日志行内的换行被压平：会话 id 不能伪造出一行假日志', async () => {
+  const rig = makeRig({});
+  const evil = { id: 'abc\ndef' };
+  rig.handlers.get('session/event')(evil, { type: 'turn/start', data: { turn: 1 }, seq: 1, time: Date.now() });
+  const log = rig.log();
+  assert.match(log, /skip scope: non-root session abc def/);
+  assert.doesNotMatch(log, /\nabc/);
+  for (const line of log.trim().split('\n')) {
+    assert.match(line, /^\[\d{4}-\d{2}-\d{2}T/, 'every log line must start with a timestamp');
+  }
   rig.cleanup();
 });
 
