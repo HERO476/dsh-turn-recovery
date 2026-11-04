@@ -66,35 +66,45 @@
     foregroundKinds: []      # 追加「会取消待发补写」的来源 kind（默认 user / agent-message）
     budgetFile: ''           # 空 = <DSH_HOME>/state/turn-recovery/nudges.log（跨重启限流）
     logFile: ''              # 空 = <DSH_HOME>/logs/turn-recovery.log
+    dryRun: false            # true = 判定/限流/日志全部照走，但不真的投递（验证用）
 ```
 
 配置做严格解析：`maxNudgesPerHour: 0` 是**关闭补写**，不会被默认值吞成 3；`delayMs: "abc"` 这类非法值回落到默认值；`enabled: "false"`（字符串）与 `false` 等价。
+
+宿主**不校验**插件配置（本包不导出 `Config` schema，原因见「实现约束」），所以键名写错不会被谁拦下来。插件改为在加载期自查：未知键、类型不符、`sessionScope` 取值不对等，逐条写进日志（`config issue: "minNudgesPerHour" is unknown -> ignored`），插件照常启用。改完配置先看这几行，比猜「为什么没生效」划算。
 
 ## 日志
 
 默认写到 `<DSH_HOME>/logs/turn-recovery.log`（未设 `DSH_HOME` 时是 `~/.dsh/logs/…`；主路径不可写时兜底到系统临时目录；超过 5 MB 自动轮转为 `.1`）：
 
 ```
-[2026-10-25T01:49:13.941Z] plugin activated: pid=17520 enabled=true instruction=true dshHome=C:\Users\me\.dsh
+[2026-10-25T01:49:13.941Z] plugin activated: pid=17520 version=0.2.2 enabled=true instruction=true dryRun=false dshHome=C:\Users\me\.dsh
 [2026-10-25T01:49:13.942Z] prompt section registered: order=960 chars=222
 [2026-10-25T01:49:13.942Z] guard armed (instruction=registered, uptime=1ms)
 [2026-10-25T01:58:02.114Z] turn/end turn=3 kind=completed steps=4 visibleChars=812 empty=false wasGuard=false sawStart=true [5f884825]
 [2026-10-25T02:03:41.507Z] turn/end turn=4 kind=completed steps=6 visibleChars=0 empty=true wasGuard=false sawStart=true [5f884825]
 [2026-10-25T02:03:41.508Z] nudge SCHEDULED turn=4 delay=900ms [5f884825] (empty completed turn)
+[2026-10-25T02:03:41.509Z] nudge outcome turn=4: scheduled [5f884825]
 [2026-10-25T02:03:42.561Z] nudge DELIVERED via send(next-turn,wakeup) [5f884825]
 [2026-10-25T02:03:45.004Z] guard message claimed turn=5 matched=true [5f884825]
 ```
 
-正常回合只需看 `empty=false`；出现 `empty=true` 就应紧跟一条 `nudge DELIVERED`，再往后出现 `guard message claimed ... matched=true` 才说明补写回合真的起来了。`[...]` 是会话 id（剥掉 `session-` 前缀）前 8 位，`wasGuard` 表示该回合是不是补写回合，`sawStart` 表示插件是否看到过该回合的 `turn/start`（中途热加载时为 false，此时不判定）。
+正常回合只需看 `empty=false`；出现 `empty=true` 就应紧跟 `nudge outcome turn=N: scheduled` 与 `nudge DELIVERED`，再往后出现 `guard message claimed ... matched=true` 才说明补写回合真的起来了。`[...]` 是会话 id（剥掉 `session-` / `orchestrator-` / `worker-` 前缀）前 8 位，`wasGuard` 表示该回合是不是补写回合，`sawStart` 表示插件是否看到过该回合的 `turn/start`（中途热加载时为 false，此时不判定）。
+
+只想验证判定链、不想真的多跑一轮模型时，把 `dryRun` 打开，日志会写 `nudge DRY-RUN: would deliver turn=N` 并停在那里（既不投递，也不占小时预算）。
 
 `version=` 是进程里真正加载的版本号（从包自身 `package.json` 读）——**升级后先看这一行**，不要靠「某个日志字段有没有」推断跑的是哪一版（0.1.4 与 0.1.5 都打过 `sawStart`，这个推断会错）。
 
-排查常用短语：`skip scope`（被 `sessionScope` 过滤掉的会话，括号里写明是 `header says subagent` 还是 `id is not a root shape`）、`guard NOT armed (fail-closed`（同名 prompt 段落已被占用，插件整体不启用，不再谎报 armed）、`inbox already holds a pending turn-recovery nudge`（队列里已有一笔，未重复投递）、`turn/start not observed`（热加载中途，不判定）、`NOT ours`（同来源但 id 对不上，已忽略）、`DISCARDED by host`（用户停止，补写被丢弃）、`a nudge is already awaiting claim`（上一笔还没被认领）、`stop chaining`（补写回合又空，按设计不再连环）、`budget exhausted`（本小时额度用完）。
+排查常用短语：`config issue`（配置写错，插件仍启用）、`skip scope`（被 `sessionScope` 过滤掉的会话，括号里写明是 `header says subagent` 还是 `id is not a root shape`）、`guard NOT armed (fail-closed`（同名 prompt 段落已被占用，插件整体不启用，不再谎报 armed）、`inbox already holds a pending turn-recovery nudge`（队列里已有一笔，未重复投递）、`turn/start not observed`（热加载中途，不判定）、`NOT ours`（同来源但 id 对不上，已忽略）、`LATE, from guardIds`（认领超时后才到，仍按补写回合处理）、`DISCARDED by host`（用户停止，补写被丢弃）、`a nudge is already awaiting claim`（上一笔还没被认领）、`skipped:in-flight`（本回合没排上，因为上一笔仍在途 —— 不算「已补过」）、`turn N already handled`（该回合确实排过或确实被限流）、`DROPPED: turn moved on`（定时器到点时会话已进入下一回合）、`stop chaining`（补写回合又空，按设计不再连环）、`budget exhausted`（本小时额度用完）。
 
 ## 实现约束
 
 - 只 import Node 内置模块（`node:fs` / `node:os` / `node:path` / `node:crypto`）。插件被装进 profile 的 `node_modules` 后，裸名 `@deepseek-ai/*` 在插件目录下 Node 解析不到，少一个依赖就少一个「插件整个加载失败」的风险面。
-- 不导出 `Config` schema（宿主允许无 schema 的 entry），配置在 `apply(ctx, config)` 内部做防御性默认值合并。
+- **不导出 `Config` schema**，配置在 `apply(ctx, config)` 内部做防御性默认值合并 + 加载期自查。这不是偷懒，是三个约束撞在一起的结果：
+  1. cordis 的配置解析走 Standard Schema v1（`runtime.Config["~standard"].validate(config)`），只要导出一个带该方法的对象就能校验；
+  2. 但宿主另有一条 schemastery 专用路径 —— `isSchemastery()`（`cordis-plugin-loader`）与 `isNativeConfigSchema()`（要求 `value[Symbol.for('schemastery')] === true`）都按 schemastery 判别，非 schemastery 的 schema 会被当成「没有 schema」；
+  3. 而 `dsh-settings` 投影表单时**直接读** `schema.type` / `schema.dict` / `schema.meta.volatile`，没有上面那层判别保护 —— 一个形状不对的 `Config` 有可能让设置页报错。
+  本包零依赖，装进 profile 后也解析不到 `schemastery`（更不能 import `@deepseek-ai/*`）。与其导出一个「在 A 路径像 schema、在 B 路径像垃圾」的对象，不如不导出，把校验放在加载期日志里：错了能看见，也不会让设置页崩。
 - 所有逻辑包在 try/catch 里：任何异常只写日志，不向上抛，不会拖垮宿主回合。
 - 宿主门槛 `engines.dsh = ">=0.2.1-rc.1 <0.3.0-0"`：本插件用到的宿主 API 在 `0.2.1-rc.1` / `rc.2` / `rc.3` / `rc.4` / `rc.5` 里实现完全一致（rc.3 / rc.4 / rc.5 的 `dsh-system-prompt` / `dsh-agent` / `dsh-session` / `dsh-agent-loop` / `dsh-app-boot` 的 `lib/index.js` sha256 逐字节相同），所以门槛只设到 rc.1。**不要写成 `>=0.2.1`**——semver 里预发布版本不满足不含预发布标识的同段范围，`0.2.1-rc.3` 对 `>=0.2.1` 判为 `false`，会连 rc 版本一起挡掉。上界必须写成 `<0.3.0-0`：宿主用 `semver` 的 `includePrerelease: true` 判定门槛，写成 `<0.3.0` 时 `0.3.0-alpha.1` / `0.3.0-beta.2` 都会被判为满足（实测 `semver.satisfies('0.3.0-alpha.1', '>=0.2.1-rc.1 <0.3.0', {includePrerelease:true}) === true`），插件会带着未验证的假设加载到下一主线；`-0` 是显式的预发布截断。`scripts/check-metadata.mjs` 会强制检查这个写法。门槛不满足时宿主会把整个 bundle 静默跳过（启动只留一行 `skipping profile bundle`）。
 - **升级宿主前请先看门槛**：`<0.3.0-0` 的上界意味着宿主升到 0.3.0（含 `0.3.0-alpha*` / `0.3.0-beta*`）时本插件会**静默不加载**（`dsh-app-boot` 只往 stderr 写一行 `skipping profile bundle`）。请先看日志首行 `plugin activated: ... version=...`：没有这一行就是没加载。届时要么升级本插件并把上界往上放，要么临时把 `engines.dsh` 放宽（自担 API 漂移风险）。
@@ -102,13 +112,13 @@
 
 ## 已知限制
 
-- **补写消息以 `role: 'user'` 落盘**（`source.kind = 'plugin:turn-recovery'`）：宿主 session 层对 `source.kind` 不做枚举校验，插件侧也改不了 role。桌面前端按 `source.kind !== 'user'` 渲染成上下文卡片（不是用户气泡），mnemon 只收录 `source.kind === 'user'`，所以界面与记忆都不受污染；但**会话转录文件里它确实是一条 user 消息**，审计时要看 `source.kind` 区分。
+- **补写消息以 `role: 'user'` 落盘**（`source.kind = 'plugin:turn-recovery'`）：宿主 session 层对 `source.kind` 不做枚举校验（只要求非空字符串），插件侧也改不了 role。桌面前端按 `source.kind !== 'user'` 渲染成上下文卡片（不是用户气泡），mnemon 只收录 `source.kind === 'user'`，所以界面与记忆都不受污染；但**会话转录文件里它确实是一条 user 消息**，审计时要看 `source.kind` 区分。另外 `plugin:*` 这个前缀不在宿主 `MessageSourceMap` 的类型联合里 —— 运行时不受影响（前端对未知 kind 走 `default` 分支，显示为「请求」卡片），但下游按类型联合写的消费者会漏掉它。
 - **用户点停止的窗口**：宿主 `cancel()` 只清 inbox + abort，不 append 任何 session 事件。插件订阅了宿主 dispatch 的 `agent/inbox/discarded` 来撤掉自己那条补写，但该事件是否向插件广播取决于宿主的 dispatch 链路；收不到时，「用户已点停止、插件仍在 `delayMs` 后补写」这个窗口依然存在（默认 900ms，可通过 `delayMs` 调小）。真正发出去的那一回合仍受宿主 abort 语义约束。
 - **`sessionScope: 'root'` 的判定依据是宿主的 `Session.header`**：`origin === 'subagent'` 或 `delegationDepth > 0` 才算子代理会话，`orchestrator-*` 这类顶层会话会被正常处理（0.2.0 用 id 前缀判断，把它们全部判成子代理，实测日志里有 19 次静默跳过）。宿主没有 header 的场合（老宿主、测试桩）退回 id 形态：`session-*` / `orchestrator-*` 算根，纯 UUID / `social-*` 不算。被过滤的会话每个 id 只记一条 `skip scope` 日志，不会静默消失。
 - **可见字符是「按回合累计」而不是「末条消息」**：一个回合里先写了结论、后来又被工具调用打断的，累计口径下不算空（这是刻意的：用户此前已经看到了文字）。反过来，`aborted` / `interrupted` 等非 `completed` 回合一律不补写，即使它确实没留下正文 —— 那些回合多半是用户自己喊停的，再补一轮会变成「已取消还继续跑」。
-- **崩溃遗留**：补写已入队但宿主在认领前崩溃时，该消息可能在下次启动被重放。插件只认 id 匹配的认领（`NOT ours`），因此不会被这种消息骗成「补写回合」，但它仍可能作为一条插件消息出现在转录里。
+- **崩溃遗留**：补写已入队但宿主在认领前崩溃时，该消息可能在下次启动被重放。插件只认 id 匹配的认领（`NOT ours`），因此不会被这种消息骗成「补写回合」，但它仍可能作为一条插件消息出现在转录里。为覆盖「120s 认领超时后才被认领」的情形，最近 8 条投递 id 会留在内存里（`LATE, from guardIds`），进程重启后这份记忆就没了。
 - **多宿主共用同一日志文件**：两个进程同时写同一路径时轮转可能失败，此时回退 `truncate(0)` 并记一条 `log rotate fell back to truncate`。
-- **生产环境尚未观测到真实补写**：截至 2026-10-30，本机生产日志里 `nudge DELIVERED` 仍为 0（空回合全部是 `aborted`），所有结论来自单测与 mock 复现。真机端到端（含「补写回合真的开起来」）仍是未验证项。
+- **生产环境仍未观测到真实补写**：截至 2026-11-04，本机生产日志里 `nudge DELIVERED` 仍为 0（空回合全部是 `aborted` / `blocked`），所有结论来自单测与 mock 复现。要闭合这一项，请在真机上临时设置 `dryRun: true`，等一次 `completed` 空回合，确认日志出现 `nudge DRY-RUN: would deliver`（判定链在生产成立），再关掉 `dryRun` 等真实投递 —— 这比直接开补写更安全：干跑不会多跑一轮模型。
 
 ## License
 

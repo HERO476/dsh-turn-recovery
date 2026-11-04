@@ -750,6 +750,115 @@ test('日志行内的换行被压平：会话 id 不能伪造出一行假日志'
   rig.cleanup();
 });
 
+test('P3-1：scheduleNudge 早退（已有在途补写）时不把该回合记成「已补过」', async () => {
+  const rig = makeRig({ delayMs: 5 });
+  rig.fire('turn/start', { turn: 80 });
+  rig.fire('assistant/message', { turn: 80, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 80, reason: { kind: 'completed' } });
+  await sleep(40);
+  assert.equal(rig.sent.length, 1, 'first empty turn should deliver');
+  // 下一回合到来时上一笔仍在途：scheduleNudge 必须早退，且这个回合不能被记账成已处理
+  // （旧版先置位再早退，日志会写 already nudged，而其实这个回合根本没排上补写）。
+  rig.fire('turn/start', { turn: 81 });
+  rig.fire('assistant/message', { turn: 81, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 81, reason: { kind: 'completed' } });
+  await sleep(40);
+  const log = rig.log();
+  assert.equal(rig.sent.length, 1, 'must not deliver twice while one is in flight');
+  assert.match(log, /nudge outcome turn=81: skipped:in-flight/);
+  assert.doesNotMatch(log, /turn 81 already handled/);
+  rig.cleanup();
+});
+
+test('P3-2：turn/end 不清 scheduledTurn → 回合已前进的定时器被丢弃', async () => {
+  const rig = makeRig({ delayMs: 40 });
+  rig.fire('turn/start', { turn: 81 });
+  rig.fire('assistant/message', { turn: 81, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 81, reason: { kind: 'completed' } });
+  // 定时器还没跑，宿主已经开了下一个回合（没有 turn/start 的那种：直接来 assistant/message）。
+  rig.fire('assistant/message', { turn: 82, step: 1, message: assistant('有正文') });
+  await sleep(80);
+  assert.equal(rig.sent.length, 0, 'stale nudge must be dropped, not injected into turn 82');
+  assert.match(rig.log(), /nudge DROPPED: turn moved on \(scheduled=81 current=82\)/);
+  rig.cleanup();
+});
+
+test('dryRun：判定链照走、日志留痕，但不真的投递（也不占预算）', async () => {
+  const rig = makeRig({ delayMs: 5, dryRun: true });
+  rig.fire('turn/start', { turn: 83 });
+  rig.fire('assistant/message', { turn: 83, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 83, reason: { kind: 'completed' } });
+  await sleep(60);
+  assert.equal(rig.sent.length, 0, 'dryRun must not hand anything to the host');
+  const log = rig.log();
+  assert.match(log, /dryRun=true/);
+  assert.match(log, /empty=true/);
+  assert.match(log, /nudge DRY-RUN: would deliver turn=83/);
+  assert.match(log, /nudge outcome turn=83: dry-run/);
+  assert.equal(fs.existsSync(rig.budgetFile), false, 'dryRun must not consume the hourly budget');
+  rig.cleanup();
+});
+
+test('P3-3：认领超时后晚到的认领仍算补写回合（靠 guardIds，不误判连环补写）', async () => {
+  const rig = makeRig({ delayMs: 5 });
+  rig.fire('turn/start', { turn: 84 });
+  rig.fire('assistant/message', { turn: 84, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 84, reason: { kind: 'completed' } });
+  await sleep(40);
+  assert.equal(rig.sent.length, 1);
+  const id = lastSentId(rig);
+  // 真实宿主顺序：先 turn/start 开回合，再把队列里的消息写进转录。
+  rig.fire('turn/start', { turn: 85 });
+  rig.fire('user/message', guardClaim(id));
+  rig.fire('assistant/message', { turn: 85, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 85, reason: { kind: 'completed' } });
+  await sleep(40);
+  assert.match(rig.log(), /stop chaining/, 'a still-empty guard turn must not chain');
+  // 补写回合结束清掉了在途标记，但 guardIds 还留着这个 id。
+  // 宿主此时重放/晚到认领同一条消息：仍应被认作补写回合，而不是「不是我们的」。
+  rig.fire('user/message', guardClaim(id));
+  assert.match(rig.log(), /guard message claimed \(LATE, from guardIds\)/);
+  // 真·连环补写的防线仍然生效：紧接着的空回合不再补写。
+  rig.fire('turn/start', { turn: 86 });
+  rig.fire('assistant/message', { turn: 86, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 86, reason: { kind: 'completed' } });
+  await sleep(40);
+  assert.equal(rig.sent.length, 1, 'the replayed claim must still mark a guard turn');
+  rig.cleanup();
+});
+
+test('配置写错（未知键/类型不符）→ 加载期写日志，仍然启用，不抛错', async () => {
+  const rig = makeRig({
+    typoKey: 1,
+    minVisibleChars: 'abc',
+    sessionScope: 'nope',
+    foregroundKinds: 'user',
+    delayMs: 5,
+  });
+  const log = rig.log();
+  assert.match(log, /config issue: unknown key "typoKey" ignored/);
+  assert.match(log, /config issue: "minVisibleChars" expects a number/);
+  assert.match(log, /config issue: "sessionScope" expects "root" \| "all"/);
+  assert.match(log, /config issue: "foregroundKinds" expects an array/);
+  assert.match(log, /config issues: 4/);
+  assert.match(log, /guard armed/);
+  rig.fire('turn/start', { turn: 87 });
+  rig.fire('assistant/message', { turn: 87, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 87, reason: { kind: 'completed' } });
+  await sleep(40);
+  assert.equal(rig.sent.length, 1, 'bad config must not disable the guard');
+  rig.cleanup();
+});
+
+test('日志 tag：worker-* 会话也剥前缀（不再只剩 "worker-a"）', async () => {
+  const rig = makeRig({ sessionScope: 'all', __sessionId: 'worker-abc12345' });
+  rig.fire('turn/start', { turn: 88 });
+  rig.fire('turn/end', { turn: 88, reason: { kind: 'blocked' } });
+  assert.match(rig.log(), /\[abc12345\]/);
+  assert.doesNotMatch(rig.log(), /\[worker-a\]/);
+  rig.cleanup();
+});
+
 let failed = 0;
 for (const c of cases) {
   try {

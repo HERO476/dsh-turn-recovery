@@ -7,6 +7,54 @@
 > `@nlflora/dsh-empty-turn-guard`）冲突，自 0.2.0 起更名为 `dsh-turn-recovery`。0.1.x 及更早的条目保留旧名原文，
 > 其提到的 `plugin:empty-turn-guard`、`empty-turn-guard.log` 等标识在 0.2.0 起分别改为 `plugin:turn-recovery`、`turn-recovery.log`。
 
+## [0.2.2] - 2026-11-04
+
+**代码审查修复 + 可验证性补强**。针对 0.2.1 的复审（宿主 `0.2.2-alpha.3` 源码取证、
+`~/.dsh/logs/turn-recovery.log` 28 次激活 0 次 `nudge DELIVERED` 的实证）逐项修复，
+不含行为方向的改变，但对「补写到底有没有发生」的日志与状态记账做了实质纠正。
+
+### 新增
+
+- **`dryRun` 配置项**：判定链、限流、日志全部照走，唯独不把补写交给宿主。
+  这是给「生产环境从未观测到真实补写」准备的验证通道 —— 在真机上把 `dryRun: true`，
+  等一次空回合，日志里出现 `nudge DRY-RUN: would deliver` 就说明整条判定链在生产可用，
+  而且不会因此多跑一轮模型、不占小时预算。
+
+### 修复
+
+- **`guardSentForTurn` 先置位、后调度**（P3-1）：`scheduleNudge` 可能在内部早退
+  （已有在途补写 / 宿主队列里已有一笔 / 干跑），旧版在此之前就把回合记成「已补过」，
+  日志写 `already nudged` 而实际一笔没发，同一回合再触发一次 `turn/end` 也就永久放弃。
+  现在 `scheduleNudge` 返回 `scheduled` / `dry-run` / `skipped:<原因>`，只有真的接了活才记账，
+  并额外打一行 `nudge outcome turn=N: <结果>`。字段同时更名为 `nudgeHandledTurn`（语义更准）。
+- **`turn/end` 提前清空 `pendingTurn`**（P3-2）：那道「回合已前进就丢弃定时器」的检查靠它做判据，
+  而 `turn/end` 在调度之后又把它清零，于是一个没有 `turn/start` 的第二个 `turn/end` 之后
+  检查恒不生效，补写可能插进下一个回合。现在 `turn/end` 不再碰它（更名 `scheduledTurn`），
+  清理职责只落在定时器自身与 `clearTimer` 上。
+- **认领超时可重排第二笔**（P3-3）：120s 超时后 `nudgeMessageId` 被清掉并允许重排，
+  但宿主仍可能认领那笔「已超时」的消息，旧版会把它判成 `NOT ours`，导致后面的空回合
+  又被补一笔。现在保留最近 8 条投递 id（`guardIds`），晚到的认领照样算作补写回合
+  （日志 `guard message claimed (LATE, from guardIds)`）。同时把「清在途标记」挪到
+  宿主队列去重之后，避免清掉标记后重复排期。
+- **`budgetHistory` 只增不减**（P2-2）：跨重启限流的内存 map 生命周期等于进程，旧版只在
+  预算文件 >1 MB 时重建，重建后 map 里仍留着过期条目。现在重建时按一小时窗口同时修剪 map，
+  并每 256 次投递做一次纯内存修剪（清过期条目与空会话）。
+- **配置写错无人报警**（P3-4）：宿主不校验插件配置（本包不导出 `Config` schema，原因见 README），
+  `maxNudgesPerHr`、`minVisibleChars: "abc"` 这类手滑会被静默兜底成默认值，用户以为改生效了。
+  现在加载期检查未知键、数字/布尔/字符串类型、`sessionScope` 取值、`foregroundKinds` 形态，
+  逐条写 `config issue: ...` 与汇总行。只报告、不抛错 —— 一个笔误不该让整个插件拒绝加载。
+- **日志 `tag()` 对 `worker-*` 只截前 8 位**（P3-6）：前缀剥离正则补上 `worker-`，
+  多 worker 会话不再全挤成 `[worker-a]`。
+
+### 说明
+
+- **`source.kind = 'plugin:turn-recovery'` 不在宿主 `MessageSourceMap` 的类型联合内**（P3-5）：
+  宿主运行时只校验 `source.kind` 是非空字符串（`dsh-session` 的 `assertMessageEventShape`），
+  类型联合的缺项只影响本仓库以外的 TS 读者，前端对未知 kind 有 `default` 分支。
+  保持现状并写进 README「已知限制」，不改协议用法。
+- 回归用例 43 → 49：新增 P3-1（早退不记账）、P3-2（回合前进丢弃）、`dryRun`、
+  P3-3（晚到认领）、配置写错告警、`worker-` tag。
+
 ## [0.2.1] - 2026-11-03
 
 **适配性修复**：针对 DSH `0.2.2-alpha.3` 实测（宿主 `dsh-session` / `dsh-agent-loop` /
