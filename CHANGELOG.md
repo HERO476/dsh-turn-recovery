@@ -7,6 +7,50 @@
 > `@nlflora/dsh-empty-turn-guard`）冲突，自 0.2.0 起更名为 `dsh-turn-recovery`。0.1.x 及更早的条目保留旧名原文，
 > 其提到的 `plugin:empty-turn-guard`、`empty-turn-guard.log` 等标识在 0.2.0 起分别改为 `plugin:turn-recovery`、`turn-recovery.log`。
 
+## [0.2.3] - 2026-11-05
+
+**三方复核（架构 / 安全 / 验收）后的加固版**。0.2.2 的判定链没有 P0 缺陷，但复核在
+持久化文件与部署侧查出实质问题：预算文件可被本地输入拖垮或投毒、跨重启的补写 id 记忆
+不落盘、段落注册一次冲突就让插件永久停摆、inbox 去重依赖未公开结构却没有探测。
+本版逐项修掉，并补齐 README 里对「桌面端 vs 网页端」的错误期待。
+
+### 修复
+
+- **预算文件同步整读会阻塞宿主**（安全复核实测 64 MB ≈ 544 ms）：`hydrateBudget` 改为先
+  `stat`，超过 1 MiB 只读尾部并丢掉截断的首行，日志留一行
+  `persisted state read: file is …B, tail …B only`。
+- **预算文件可被未来时间戳投毒**：一条 `at > now` 的记录会让 `now - t < HOUR_MS` 恒成立、
+  永久留在预算里，该会话从此被判成「本小时预算用尽」而静默不补写。解析与修剪统一加
+  `+5min` 时钟容忍，超出即丢弃。
+- **预算记录格式改为 JSON 行**：旧格式 `id at` 在会话 id 含空格时会被截断成错账；
+  新格式兼容读旧文件（两种都认）。
+- **压缩预算文件会覆盖别的进程刚追加的行**：改为「重读磁盘 → 合并 → 临时文件 → `rename`
+  原子替换」，并把写入统一成 append-only。
+- **跨重启的补写 id 不落盘**：新增 `<budgetFile 同目录>/guard-ids.log`（JSON 行，
+  24 小时 TTL、每会话 8 条）。宿主重启后认领「重启前投递」的那条消息时仍记为
+  `LATE, from guardIds`，补写回合再空不会连环补第二笔。
+- **段落注册一次失败就永久停摆**：改为最多重试 3 次（150 ms 间隔），只有注册成功才
+  `armed`；重试耗尽仍 fail-closed（`guard NOT armed`），期间所有判定链不工作
+  （`session/event` 与 `deliver` 都先看 `armed`）。
+- **`agent.inbox.nextTurn` 去重依赖未公开结构**：加能力探测，缺失时记一行
+  `inbox dedupe UNAVAILABLE …` 并降级（认领 id 匹配仍在），不再静默失效。
+- **`skip scope` 日志上限**：200 → 2000，且触顶时明确记一行，不再无声无息。
+
+### 变更
+
+- `nudge DRY-RUN` 日志补 `budgetUsed=n/max`，并注明干跑不落预算 —— 旧文案容易让人以为
+  `dryRun` 能验证限流。
+- README 新增「桌面端与网页端」章节：内嵌 Web UI 与桌面端同进程同实例；独立
+  `dsh web` 在 `profiles/web` 不存在时走出厂模板，插件静默不加载。
+- 回归用例 49 → 58：预算尾部读取、未来时间戳、JSON 落盘、跨重启认领、inbox 探测降级、
+  段落注册重试成功，以及 `enabled:false` / `injectInstruction:false` 三条开关语义。
+
+### 未变
+
+- 补写消息仍是 `role: 'user'` + `source.kind = 'plugin:turn-recovery'`（宿主不允许插件改 role）。
+- 真实宿主上的端到端投递仍未观测到（生产日志 `nudge DELIVERED = 0`）。本版只加固了
+  与「能不能安全地投递」有关的边角，闭合这一项仍需要在真机上跑一次 `dryRun` + 一次真实投递。
+
 ## [0.2.2] - 2026-11-04
 
 **代码审查修复 + 可验证性补强**。针对 0.2.1 的复审（宿主 `0.2.2-alpha.3` 源码取证、

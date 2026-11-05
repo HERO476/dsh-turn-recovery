@@ -31,7 +31,12 @@ function makeRig(config = {}, registryAgents = []) {
   const logFile = path.join(os.tmpdir(), 'etg-test-' + process.pid + '-' + id + '.log');
   // 预算文件也隔离到 tmp：默认路径在 $DSH_HOME/state 下，测试写进去会污染真实环境，
   // 而且跨测试运行共用同一份记录会让「小时预算」用例变得不稳定。
-  const budgetFile = path.join(os.tmpdir(), 'etg-budget-' + process.pid + '-' + id + '.log');
+  // 0.2.3 起预算目录下还有 guard-ids.log，所以整个目录按 rig 隔离。
+  const stateDir = config.__stateDir
+    || path.join(os.tmpdir(), 'etg-state-' + process.pid + '-' + id);
+  fs.mkdirSync(stateDir, { recursive: true });
+  const budgetFile = path.join(stateDir, 'nudges.log');
+  const guardFile = path.join(stateDir, 'guard-ids.log');
   const sections = [];
   const handlers = new Map();
   const effects = [];
@@ -39,7 +44,12 @@ function makeRig(config = {}, registryAgents = []) {
   const ctx = {
     systemPrompt: {
       section: (opts) => {
-        if (config.__sectionThrows) throw new Error(config.__sectionThrows);
+        // __sectionThrows 可以是字符串（每次都抛）或函数（返回真值才抛），
+        // 后者用于「注册失败 → 重试成功」的用例。
+        const boom = typeof config.__sectionThrows === 'function'
+          ? config.__sectionThrows()
+          : config.__sectionThrows;
+        if (boom) throw new Error(boom);
         sections.push(opts);
         return () => {};
       },
@@ -55,6 +65,9 @@ function makeRig(config = {}, registryAgents = []) {
   };
   const agent = {
     session,
+    // 宿主 rc.5 的真实形状：inbox.nextTurn 是「下一回合」队列。
+    // 0.2.3 起插件会探测这个结构；缺了就降级并留一行日志。
+    inbox: { nextTurn: [], nextStep: [] },
     send(message, target, wakeup) { sent.push({ via: 'send', target, wakeup, text: message.content[0].text, message }); },
     followup(message) { sent.push({ via: 'followup', text: message.content[0].text, message }); },
     inject(message) { sent.push({ via: 'inject', text: message.content[0].text, message }); },
@@ -68,9 +81,12 @@ function makeRig(config = {}, registryAgents = []) {
   const log = () => { try { return fs.readFileSync(logFile, 'utf8'); } catch { return ''; } };
   const cleanup = () => {
     try { fs.rmSync(logFile, { force: true }); } catch {}
-    try { fs.rmSync(budgetFile, { force: true }); } catch {}
+    try { fs.rmSync(stateDir, { recursive: true, force: true }); } catch {}
   };
-  return { ctx, sections, handlers, effects, sent, session, agent, fire, log, cleanup, budgetFile };
+  return {
+    ctx, sections, handlers, effects, sent, session, agent, fire, log, cleanup,
+    budgetFile, guardFile, stateDir,
+  };
 }
 
 const assistant = (text, tool = false) => ({
@@ -683,17 +699,39 @@ test('会话范围改按 SessionHeader 判定：orchestrator-* 是根会话，or
   child.cleanup();
 });
 
-test('prompt 段落注册失败 → fail-closed：不启用补写，日志不再谎报 guard armed', async () => {
+test('prompt 段落注册失败 → fail-closed：不 arm、不投递，重试耗尽后明确留痕', async () => {
   const rig = makeRig({ __sectionThrows: 'section "turn-recovery" already registered', delayMs: 5 });
-  // fail-closed 的实现是「注册失败就 return」，因此连 session/event 都不订阅：
-  // 这里不能 fire 事件，否则测试桩自身会抛「插件未订阅」。
-  assert.equal(rig.handlers.has('session/event'), false, 'fail-closed must not arm the guard loop');
-  await sleep(20);
-  assert.equal(rig.sent.length, 0, 'guard must not arm when its instruction section failed');
+  // 0.2.3 起不再「注册失败就 return」：handlers 照常订阅，但 armed=false 时判定链一律不工作，
+  // 这样同一实例可以在旧段落 dispose 后重试成功，不必重载插件。fail-closed 语义不变：
+  // 段落没进 prompt 就绝不补写。
+  await sleep(20); // 首轮已失败，重试还没到
+  rig.fire('turn/start', { turn: 900 });
+  rig.fire('assistant/message', { turn: 900, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 900, reason: { kind: 'completed' } });
+  await sleep(700); // 等 3 次重试（150ms × 3）耗尽
+  assert.equal(rig.sent.length, 0, 'fail-closed: 未 arm 时不得投递');
   const log = rig.log();
-  assert.match(log, /prompt section registration FAILED/);
+  assert.match(log, /prompt section registration FAILED \(attempt 1\//);
   assert.match(log, /guard NOT armed \(fail-closed/);
   assert.doesNotMatch(log, /guard armed/);
+  rig.cleanup();
+});
+
+test('段落注册首次抛错、重试成功 → 仍然 arm 并正常补写', async () => {
+  let calls = 0;
+  const rig = makeRig({
+    delayMs: 5,
+    __sectionThrows: () => (++calls === 1 ? 'already registered' : ''),
+  });
+  assert.equal(rig.sections.length, 0, '首轮应当失败');
+  await sleep(300);
+  assert.equal(rig.sections.length, 1, '重试应当把段落补上');
+  assert.match(rig.log(), /guard armed/);
+  rig.fire('turn/start', { turn: 901 });
+  rig.fire('assistant/message', { turn: 901, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 901, reason: { kind: 'completed' } });
+  await sleep(60);
+  assert.equal(rig.sent.length, 1, 'arm 之后应当照常补写');
   rig.cleanup();
 });
 
@@ -856,6 +894,112 @@ test('日志 tag：worker-* 会话也剥前缀（不再只剩 "worker-a"）', as
   rig.fire('turn/end', { turn: 88, reason: { kind: 'blocked' } });
   assert.match(rig.log(), /\[abc12345\]/);
   assert.doesNotMatch(rig.log(), /\[worker-a\]/);
+  rig.cleanup();
+});
+
+test('预算文件里的未来时间戳被丢弃 → 不会让该会话永久 budget exhausted（S2）', async () => {
+  const rig = makeRig({ delayMs: 5, maxNudgesPerHour: 1 });
+  const id = rig.session.id;
+  const future = Date.now() + 6 * 60 * 60 * 1000;
+  // 注入一条「未来」的投递记录：`now - t` 为负，旧实现永远保留，该会话就永远补不了。
+  fs.writeFileSync(rig.budgetFile, JSON.stringify({ id, at: future }) + '\n');
+  rig.fire('turn/start', { turn: 902 });
+  rig.fire('assistant/message', { turn: 902, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 902, reason: { kind: 'completed' } });
+  await sleep(60);
+  assert.equal(rig.sent.length, 1, 'future timestamp must not consume the budget');
+  assert.doesNotMatch(rig.log(), /budget exhausted/);
+  rig.cleanup();
+});
+
+test('预算文件超大时只读尾部，不整份同步读（S1）', async () => {
+  const rig = makeRig({ delayMs: 5, maxNudgesPerHour: 1 });
+  const id = rig.session.id;
+  // 头部放一条「本小时已投递」，后面用 2 MB 内容把它顶出尾部读取窗口。
+  const head = JSON.stringify({ id, at: Date.now() - 1000 }) + '\n';
+  const pad = 'x'.repeat(1024 * 1024) + '\n' + 'y'.repeat(1024 * 1024) + '\n';
+  fs.writeFileSync(rig.budgetFile, head + pad);
+  rig.fire('turn/start', { turn: 903 });
+  rig.fire('assistant/message', { turn: 903, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 903, reason: { kind: 'completed' } });
+  await sleep(90);
+  assert.match(rig.log(), /persisted state read: file is \d+B, tail \d+B only/);
+  assert.equal(rig.sent.length, 1, '头部记录已在尾部窗口之外，预算应视为空');
+  rig.cleanup();
+});
+
+test('跨重启：guard-ids.log 里的补写 id 仍被认作补写回合，不再连环补写（A1）', async () => {
+  const first = makeRig({ delayMs: 5 });
+  first.fire('turn/start', { turn: 904 });
+  first.fire('assistant/message', { turn: 904, step: 1, message: assistant(ZW) });
+  first.fire('turn/end', { turn: 904, reason: { kind: 'completed' } });
+  await sleep(60);
+  const guardId = lastSentId(first);
+  assert.ok(guardId, 'first instance should have delivered a nudge');
+  assert.match(fs.readFileSync(first.guardFile, 'utf8'), /"sid"/, '补写 id 应当落盘');
+
+  // 模拟宿主重启：新实例内存态全空，只有同一 state 目录里的 guard-ids.log 可用。
+  const second = makeRig({ delayMs: 5, __sessionId: first.session.id, __stateDir: first.stateDir });
+  second.fire('user/message', guardClaim(guardId));
+  second.fire('assistant/message', { turn: 905, step: 1, message: assistant(ZW) });
+  second.fire('turn/end', { turn: 905, reason: { kind: 'completed' } });
+  await sleep(80);
+  assert.match(second.log(), /guard message claimed \(LATE, from guardIds\)/);
+  assert.equal(second.sent.length, 0, '补写回合本身是空的也不得连环补写');
+  second.cleanup();
+  first.cleanup();
+});
+
+test('宿主不再暴露 agent.inbox.nextTurn → 记一行降级日志，补写照常进行（A5）', async () => {
+  const rig = makeRig({ delayMs: 5 });
+  delete rig.agent.inbox;
+  rig.fire('turn/start', { turn: 906 });
+  rig.fire('assistant/message', { turn: 906, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 906, reason: { kind: 'completed' } });
+  await sleep(60);
+  assert.match(rig.log(), /inbox dedupe UNAVAILABLE/);
+  assert.equal(rig.sent.length, 1, '去重能力缺失只降级，不影响补写本身');
+  rig.cleanup();
+});
+
+test('预算记录改用 JSON：会话 id 含空格也不会被截断（S5）', async () => {
+  const rig = makeRig({ delayMs: 5, sessionScope: 'all', __sessionId: 'session a b' });
+  rig.fire('turn/start', { turn: 907 });
+  rig.fire('assistant/message', { turn: 907, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 907, reason: { kind: 'completed' } });
+  await sleep(60);
+  assert.equal(rig.sent.length, 1);
+  const raw = fs.readFileSync(rig.budgetFile, 'utf8');
+  assert.match(raw, /"id":"session a b"/, 'id 必须完整落在 JSON 字段里');
+  rig.cleanup();
+});
+
+test('enabled:false → 只留收尾指令，不订阅判定链', async () => {
+  const rig = makeRig({ enabled: false });
+  assert.equal(rig.sections.length, 1, '指令段仍应注册');
+  assert.equal(rig.handlers.has('session/event'), false, '关闭补写时不订阅 session/event');
+  assert.match(rig.log(), /guard disabled by config; only instruction part active/);
+  assert.doesNotMatch(rig.log(), /guard armed/);
+  rig.cleanup();
+});
+
+test('injectInstruction:false → 不注册段落，补写照常（arm 不依赖段落）', async () => {
+  const rig = makeRig({ injectInstruction: false, delayMs: 5 });
+  assert.equal(rig.sections.length, 0);
+  assert.match(rig.log(), /guard armed \(instruction=disabled/);
+  rig.fire('turn/start', { turn: 908 });
+  rig.fire('assistant/message', { turn: 908, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 908, reason: { kind: 'completed' } });
+  await sleep(60);
+  assert.equal(rig.sent.length, 1);
+  rig.cleanup();
+});
+
+test('enabled:false + injectInstruction:false → 两项都不做', async () => {
+  const rig = makeRig({ enabled: false, injectInstruction: false });
+  assert.equal(rig.sections.length, 0);
+  assert.equal(rig.handlers.has('session/event'), false);
+  assert.match(rig.log(), /guard disabled by config and injectInstruction=false/);
   rig.cleanup();
 });
 

@@ -31,7 +31,7 @@
 // <DSH_HOME>/profiles/<你的 profile>/package.json
 {
   "dependencies": {
-    "dsh-turn-recovery": "^0.2.1"
+    "dsh-turn-recovery": "^0.2.3"
   },
   "dsh": {
     "profile": {
@@ -65,6 +65,7 @@
     sessionScope: root       # root = 只处理根会话（按 SessionHeader 判定）；all = 连子代理会话一起
     foregroundKinds: []      # 追加「会取消待发补写」的来源 kind（默认 user / agent-message）
     budgetFile: ''           # 空 = <DSH_HOME>/state/turn-recovery/nudges.log（跨重启限流）
+                             # 同目录还会写 guard-ids.log（跨重启认出晚到认领的补写 id）
     logFile: ''              # 空 = <DSH_HOME>/logs/turn-recovery.log
     dryRun: false            # true = 判定/限流/日志全部照走，但不真的投递（验证用）
 ```
@@ -72,6 +73,18 @@
 配置做严格解析：`maxNudgesPerHour: 0` 是**关闭补写**，不会被默认值吞成 3；`delayMs: "abc"` 这类非法值回落到默认值；`enabled: "false"`（字符串）与 `false` 等价。
 
 宿主**不校验**插件配置（本包不导出 `Config` schema，原因见「实现约束」），所以键名写错不会被谁拦下来。插件改为在加载期自查：未知键、类型不符、`sessionScope` 取值不对等，逐条写进日志（`config issue: "minNudgesPerHour" is unknown -> ignored`），插件照常启用。改完配置先看这几行，比猜「为什么没生效」划算。
+
+## 桌面端与网页端
+
+两者不是两条独立的加载路径，别按「装一份、两边都生效」理解：
+
+- **桌面应用里内嵌的 Web UI（浏览器打开的那个端口）与桌面端是同一个宿主进程、同一个 profile、同一个插件实例**。插件对它是生效的，不需要额外注册。
+- **独立运行 `dsh web`（等价于 `--profile web`）** 时，如果 `<DSH_HOME>/profiles/web` 不存在，宿主会用出厂模板初始化该 profile（只含 `dsh-base` + `dsh-web-app`）。**本插件不在其中，网页端会静默无保护** —— 既不加载、也不报错，连一条 `skip scope` 都不会有。
+- `headless` profile 同理（模板只含 base + headless）。
+
+需要独立 web/headless 宿主时，显式注册三处（与 desktop profile 一样）：`profiles/<name>/package.json` 的 `dependencies` 加上本包、`dsh.profile.bundles` 加上 `dsh-turn-recovery`、`profiles/<name>/cordis.patch.yml` 加 `- id: turn-recovery` 的 config；装完用 `dsh --profile web --dump-config | grep dsh-turn-recovery` 确认条目真的在。
+
+> 2026-11-05 本机实测：`<DSH_HOME>/profiles/` 只有 `desktop` 与 `headless`，没有 `web`。当时浏览器里那个端口由桌面宿主进程提供服务（端口 owner 与日志里 `plugin activated` 的 pid 相同）。
 
 ## 日志
 
@@ -116,7 +129,10 @@
 - **用户点停止的窗口**：宿主 `cancel()` 只清 inbox + abort，不 append 任何 session 事件。插件订阅了宿主 dispatch 的 `agent/inbox/discarded` 来撤掉自己那条补写，但该事件是否向插件广播取决于宿主的 dispatch 链路；收不到时，「用户已点停止、插件仍在 `delayMs` 后补写」这个窗口依然存在（默认 900ms，可通过 `delayMs` 调小）。真正发出去的那一回合仍受宿主 abort 语义约束。
 - **`sessionScope: 'root'` 的判定依据是宿主的 `Session.header`**：`origin === 'subagent'` 或 `delegationDepth > 0` 才算子代理会话，`orchestrator-*` 这类顶层会话会被正常处理（0.2.0 用 id 前缀判断，把它们全部判成子代理，实测日志里有 19 次静默跳过）。宿主没有 header 的场合（老宿主、测试桩）退回 id 形态：`session-*` / `orchestrator-*` 算根，纯 UUID / `social-*` 不算。被过滤的会话每个 id 只记一条 `skip scope` 日志，不会静默消失。
 - **可见字符是「按回合累计」而不是「末条消息」**：一个回合里先写了结论、后来又被工具调用打断的，累计口径下不算空（这是刻意的：用户此前已经看到了文字）。反过来，`aborted` / `interrupted` 等非 `completed` 回合一律不补写，即使它确实没留下正文 —— 那些回合多半是用户自己喊停的，再补一轮会变成「已取消还继续跑」。
-- **崩溃遗留**：补写已入队但宿主在认领前崩溃时，该消息可能在下次启动被重放。插件只认 id 匹配的认领（`NOT ours`），因此不会被这种消息骗成「补写回合」，但它仍可能作为一条插件消息出现在转录里。为覆盖「120s 认领超时后才被认领」的情形，最近 8 条投递 id 会留在内存里（`LATE, from guardIds`），进程重启后这份记忆就没了。
+- **崩溃遗留**：补写已入队但宿主在认领前崩溃时，该消息可能在下次启动被重放。插件只认 id 匹配的认领（`NOT ours`），因此不会被这种消息骗成「补写回合」，但它仍可能作为一条插件消息出现在转录里。为覆盖「120s 认领超时后才被认领」与「重启后才被认领」两种情形，最近 8 条投递 id 会同时留在内存与 `<budgetFile 同目录>/guard-ids.log` 里（`LATE, from guardIds`），重启后仍能认出它们，不会把补写回合再当成真空回合补第二笔。
+- **预算文件是不可信输入**：解析时会丢弃「晚于当前时钟 +5 分钟」的时间戳（否则 `now - t` 为负、该会话被永久判成预算耗尽），并且整份文件只在 1 MiB 以内整读、超过就只读尾部（避免配置写错指向几百 MB 的文件时同步阻塞宿主）。写入用 JSON 行（会话 id 含空格也不会被截断），压缩是「重读磁盘 + 临时文件原子替换」，不会覆盖另一个进程刚追加的行。
+- **多进程（桌面宿主 + 独立的 web/headless 宿主）**：各自一套内存态，`agent.inbox.nextTurn` 只对本进程可见。预算文件与补写 id 文件是共享的，因此限流大致成立，但「同一会话同时被两个宿主打开」仍可能各补一笔。同一会话请只用一个宿主。
+- **`dryRun` 不写预算文件**：判定链、日志、限流检查照走，但不投递、不记账，所以它只能证明「判定会发生」，不能用来验证限流是否生效（日志里的 `budgetUsed=n/max` 是当时的已用额度）。
 - **多宿主共用同一日志文件**：两个进程同时写同一路径时轮转可能失败，此时回退 `truncate(0)` 并记一条 `log rotate fell back to truncate`。
 - **生产环境仍未观测到真实补写**：截至 2026-11-04，本机生产日志里 `nudge DELIVERED` 仍为 0（空回合全部是 `aborted` / `blocked`），所有结论来自单测与 mock 复现。要闭合这一项，请在真机上临时设置 `dryRun: true`，等一次 `completed` 空回合，确认日志出现 `nudge DRY-RUN: would deliver`（判定链在生产成立），再关掉 `dryRun` 等真实投递 —— 这比直接开补写更安全：干跑不会多跑一轮模型。
 

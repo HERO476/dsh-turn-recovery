@@ -1,6 +1,6 @@
 {
   "name": "dsh-turn-recovery",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "DSH plugin: detect assistant turns that end with no visible text (zero-width placeholder) and re-prompt the model to write the answer; also injects a visible-closing-answer system prompt rule.",
   "license": "MIT",
   "author": "HERO476",
