@@ -7,6 +7,55 @@
 > `@nlflora/dsh-empty-turn-guard`）冲突，自 0.2.0 起更名为 `dsh-turn-recovery`。0.1.x 及更早的条目保留旧名原文，
 > 其提到的 `plugin:empty-turn-guard`、`empty-turn-guard.log` 等标识在 0.2.0 起分别改为 `plugin:turn-recovery`、`turn-recovery.log`。
 
+## [0.2.4] - 2026-11-09
+
+**运行期复核版**。0.2.3 之后按 8 天生产日志（645 个 `turn/end`）回头复查代码，
+修掉一处「装了但可能静默不工作」的状态索引隐患，并清掉每回合都要付的同步与
+日志开销；顺带把「守卫究竟为什么没触发」变成一行可读的聚合统计。
+
+### 修复
+
+- **会话状态只按 session 对象身份索引**（`P1`）：`state` 是 WeakMap，而宿主在
+  不同代码路径上可能给出不同的 session 实例（同文件的 `agentOf` 早就为此加了
+  `agentsById`）。一旦身份漂移，`turn/start` 落在对象 A、`assistant/message` 与
+  `turn/end` 落在对象 B，B 的状态里 `sawTurnStart` 恒为 false，判定链整体早退，
+  只留一行 `turn/start not observed` —— 与 0.2.1 修过的「orchestrator-* 被判成
+  子代理、19 次静默跳过」是同一类故障。现在加有界的 `stateById`（500 条）双索引，
+  `agent/disposed` 时两个索引同时清理。
+- **布尔配置拼错不会被发现**：`enabled: "flase"` 被 `enabledOr` 当成 `true` 且
+  无人提示。布尔键现在只承认 `true/false/1/0/on/off/yes/no`，其余记一条
+  `config issue: "enabled" looks like a typo`。
+- **`foregroundKinds` 里的非字符串元素被静默丢弃**：现在记一条 config issue。
+- **预算文件压缩失败会留下 `.tmp-<pid>`**：`rename` 失败（Windows 上 EPERM/EBUSY）
+  时先 unlink 再抛，不再往 state 目录里积垃圾。
+
+### 性能 / 日志
+
+- **每行日志都同步 `mkdirSync`**：目录改为只建一次（写失败复位、下次自愈），
+  少掉宿主事件循环上每行一次的同步系统调用。
+- **正常回合的 `turn/end` 行占日志一半**（实测 645/1286 行）：新增
+  `logTurns: 'empty' | 'all'`，默认 `empty` 只在空回合/跳过判定时写行，排查期切
+  `all` 恢复逐回合记录。
+- **每条 assistant 消息两遍遍历 + 一次 `Array.from()`**：合并成一次遍历的
+  `inspectMessage()`，字符数用 `for...of` 累加（仍给精确总数，日志的
+  `visibleChars` 不退化成「至少 1」）。
+- **`GUARD_IDS_MAX` 与字面量 `8` 脱钩**：投递时的截断改用常量。
+- **一小时预算谓词写了 4 遍**：抽成 `withinWindow(at, now)` 与
+  `budgetExhausted(s, now)`，窗口与时钟容忍度以后只改一处。
+
+### 可观测性
+
+- **新增 `stats:` 聚合行**（每 50 个回合 + 卸载时 `(final)`）：
+  `turns / emptyCompleted / emptyOther / delivered / claimed`。生产经验是
+  `completed` 空回合 8 天为 0、空回合全是 `steps=0` 的 `error`/`aborted`；有了
+  这行就能区分「守卫没触发是因为目标场景没发生」和「守卫坏了」。
+
+### 文档
+
+- 更正 README「已知限制」里的实测数据：空回合不是「`aborted` / `blocked`」，
+  而是 `error` 162 / `aborted` 20、`completed` 0；并补上 `logTurns`、
+  `stats` 与状态双索引的说明。
+
 ## [0.2.3] - 2026-11-05
 
 **三方复核（架构 / 安全 / 验收）后的加固版**。0.2.2 的判定链没有 P0 缺陷，但复核在

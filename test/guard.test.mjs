@@ -15,6 +15,8 @@
  * inject 不再被当作投递成功、配置 0/非法值语义、扩展零宽字符集（含 DI 属性码位）、
  * turn 前进后丢弃过期补写、小时预算、prompt 段落参数、热重载中途不误判（sawTurnStart）、
  * 图片附件回合不判空、turn 缺失不判定、会话范围（root/all）、日志 tag 剥前缀。
+ * 0.2.4 增加：session 实例漂移（状态双索引）、日志粒度（logTurns）、
+ * 布尔键拼错与 foregroundKinds 元素类型自查、每 50 回合的聚合 stats 行。
  */
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -147,7 +149,8 @@ test('零宽空回合（completed）→ 补写一次，走 send(next-turn, wakeu
 });
 
 test('正常回合 → 不干预', async () => {
-  const rig = makeRig();
+  // 0.2.4 起正常回合默认不写 turn/end 行，这里显式切成 all 以保留该断言。
+  const rig = makeRig({ logTurns: 'all' });
   rig.fire('turn/start', { turn: 2 });
   rig.fire('assistant/message', { turn: 2, step: 1, message: assistant('结论：一切正常。') });
   rig.fire('turn/end', { turn: 2, reason: { kind: 'completed' } });
@@ -374,7 +377,7 @@ test('插件在回合中途加载（没看到 turn/start）→ 不判定、不�
 });
 
 test('图片/文件附件回合 → 不算空回合', async () => {
-  const rig = makeRig();
+  const rig = makeRig({ logTurns: 'all' }); // 同上：需要逐回合日志断言 empty=false
   rig.fire('turn/start', { turn: 51 });
   rig.fire('assistant/message', {
     turn: 51,
@@ -1000,6 +1003,84 @@ test('enabled:false + injectInstruction:false → 两项都不做', async () => 
   assert.equal(rig.sections.length, 0);
   assert.equal(rig.handlers.has('session/event'), false);
   assert.match(rig.log(), /guard disabled by config and injectInstruction=false/);
+  rig.cleanup();
+});
+
+// ---- 0.2.4：状态双索引 / 日志粒度 / 配置自查 / 聚合统计 ----
+
+test('P1-1：session 实例漂移（turn/start 在 A、后续事件在 B）→ 仍判定并补写', async () => {
+  const rig = makeRig();
+  const handler = rig.handlers.get('session/event');
+  const cloneB = { id: rig.session.id }; // 同一会话，宿主换了实例
+  const fireOn = (target, type, data) => handler(target, { type, data, seq: ++seq, time: Date.now() });
+  fireOn(rig.session, 'turn/start', { turn: 60 });
+  fireOn(cloneB, 'assistant/message', { turn: 60, step: 1, message: assistant(ZW) });
+  fireOn(cloneB, 'turn/end', { turn: 60, reason: { kind: 'completed' } });
+  await sleep(60);
+  assert.equal(rig.sent.length, 1, 'id 兜底必须让跨实例的事件落到同一份状态上');
+  assert.ok(!rig.log().includes('turn/start not observed'), '不应退化成「中途加载」误判');
+  rig.cleanup();
+});
+
+test('logTurns 默认 empty：正常回合不写 turn/end 行', async () => {
+  const rig = makeRig();
+  rig.fire('turn/start', { turn: 61 });
+  rig.fire('assistant/message', { turn: 61, step: 1, message: assistant('有正文') });
+  rig.fire('turn/end', { turn: 61, reason: { kind: 'completed' } });
+  assert.ok(!rig.log().includes('turn/end turn='), '正常回合默认不写行');
+  rig.cleanup();
+});
+
+test('logTurns:"all" 恢复逐回合记录；空回合在任何粒度下都留痕', async () => {
+  const all = makeRig({ logTurns: 'all' });
+  all.fire('turn/start', { turn: 62 });
+  all.fire('assistant/message', { turn: 62, step: 1, message: assistant('有正文') });
+  all.fire('turn/end', { turn: 62, reason: { kind: 'completed' } });
+  assert.match(all.log(), /empty=false/);
+  all.cleanup();
+
+  const def = makeRig();
+  def.fire('turn/start', { turn: 63 });
+  def.fire('assistant/message', { turn: 63, step: 1, message: assistant(ZW) });
+  def.fire('turn/end', { turn: 63, reason: { kind: 'completed' } });
+  assert.match(def.log(), /empty=true/);
+  await sleep(30);
+  def.cleanup();
+});
+
+test('logTurns 非法值 → 回落 empty 并记一条 config issue', () => {
+  const rig = makeRig({ logTurns: 'verbose' });
+  assert.match(rig.log(), /"logTurns" expects "empty" \| "all"/);
+  rig.cleanup();
+});
+
+test('布尔键拼错（enabled:"flase"）→ 记 config issue，行为仍按 enabledOr（开）', () => {
+  const rig = makeRig({ enabled: 'flase' });
+  assert.match(rig.log(), /"enabled" looks like a typo/);
+  // 拼错的串在 enabledOr 眼里仍是真值 —— 这正是必须提醒用户的原因。
+  assert.ok(rig.handlers.has('session/event'), '拼错不会关闭守卫，所以要提示');
+  rig.cleanup();
+});
+
+test('foregroundKinds 里的非字符串元素 → 记 config issue（不再静默丢弃）', () => {
+  const rig = makeRig({ foregroundKinds: ['wechat-bridge', 42, ''] });
+  assert.match(rig.log(), /non-string\/empty entry in "foregroundKinds"/);
+  rig.cleanup();
+});
+
+test('H1：每 50 个回合打一行聚合 stats，卸载时再打 final', async () => {
+  const rig = makeRig();
+  for (let i = 0; i < 50; i += 1) {
+    rig.fire('turn/start', { turn: 100 + i });
+    rig.fire('assistant/message', { turn: 100 + i, step: 1, message: assistant('正文 ' + i) });
+    rig.fire('turn/end', { turn: 100 + i, reason: { kind: 'completed' } });
+  }
+  assert.match(rig.log(), /stats: turns=50 /);
+  for (const eff of rig.effects) {
+    const dispose = eff();
+    if (typeof dispose === 'function') dispose();
+  }
+  assert.match(rig.log(), /stats: .*\(final\)/);
   rig.cleanup();
 });
 

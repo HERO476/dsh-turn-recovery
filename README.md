@@ -67,10 +67,11 @@
     budgetFile: ''           # 空 = <DSH_HOME>/state/turn-recovery/nudges.log（跨重启限流）
                              # 同目录还会写 guard-ids.log（跨重启认出晚到认领的补写 id）
     logFile: ''              # 空 = <DSH_HOME>/logs/turn-recovery.log
+    logTurns: empty          # empty = 只记空回合/被跳过判定的回合；all = 连正常回合也记
     dryRun: false            # true = 判定/限流/日志全部照走，但不真的投递（验证用）
 ```
 
-配置做严格解析：`maxNudgesPerHour: 0` 是**关闭补写**，不会被默认值吞成 3；`delayMs: "abc"` 这类非法值回落到默认值；`enabled: "false"`（字符串）与 `false` 等价。
+配置做严格解析：`maxNudgesPerHour: 0` 是**关闭补写**，不会被默认值吞成 3；`delayMs: "abc"` 这类非法值回落到默认值；`enabled: "false"`（字符串）与 `false` 等价。布尔键只承认 `true/false/1/0/on/off/yes/no`，`enabled: "flase"` 这类拼错会被记成 config issue（行为仍按真值走，所以要留意日志）。
 
 宿主**不校验**插件配置（本包不导出 `Config` schema，原因见「实现约束」），所以键名写错不会被谁拦下来。插件改为在加载期自查：未知键、类型不符、`sessionScope` 取值不对等，逐条写进日志（`config issue: "minNudgesPerHour" is unknown -> ignored`），插件照常启用。改完配置先看这几行，比猜「为什么没生效」划算。
 
@@ -102,7 +103,19 @@
 [2026-10-25T02:03:45.004Z] guard message claimed turn=5 matched=true [5f884825]
 ```
 
-正常回合只需看 `empty=false`；出现 `empty=true` 就应紧跟 `nudge outcome turn=N: scheduled` 与 `nudge DELIVERED`，再往后出现 `guard message claimed ... matched=true` 才说明补写回合真的起来了。`[...]` 是会话 id（剥掉 `session-` / `orchestrator-` / `worker-` 前缀）前 8 位，`wasGuard` 表示该回合是不是补写回合，`sawStart` 表示插件是否看到过该回合的 `turn/start`（中途热加载时为 false，此时不判定）。
+正常回合默认**不写** `turn/end` 行（`logTurns: empty`）：实测这类行占日志的一半，而它只在「某个回合为什么没被判空」时才有人看。要看逐回合记录就把 `logTurns` 切成 `all`，此时格式同上。空回合的 `empty=true` 行在任何粒度下都会留下。
+
+每 50 个回合会多一行聚合统计，卸载/重载时再打一行 `(final)`：
+
+```
+[…Z] stats: turns=50 emptyCompleted=0 emptyOther=37 delivered=0 claimed=0
+```
+
+`emptyCompleted` 是守卫真正要救的那一类（`completed` 却没有正文）；`emptyOther` 是 `error` / `aborted` 等按设计不补写的空回合。长期出现 `emptyCompleted=0` 而 `emptyOther>0`，说明「守卫没触发」是因为目标场景本身没发生，而不是插件坏了；只有 `delivered` 与 `claimed` 的差值才说明投递链路是否真的接通。
+
+出现 `empty=true` 时应紧跟 `nudge outcome turn=N: scheduled` 与 `nudge DELIVERED`，再往后出现 `guard message claimed ... matched=true` 才说明补写回合真的起来了。
+
+`[...]` 是会话 id（剥掉 `session-` / `orchestrator-` / `worker-` 前缀）前 8 位，`wasGuard` 表示该回合是不是补写回合，`sawStart` 表示插件是否看到过该回合的 `turn/start`（中途热加载时为 false，此时不判定）。
 
 只想验证判定链、不想真的多跑一轮模型时，把 `dryRun` 打开，日志会写 `nudge DRY-RUN: would deliver turn=N` 并停在那里（既不投递，也不占小时预算）。
 
@@ -125,6 +138,7 @@
 
 ## 已知限制
 
+- **会话状态是双索引**：`state` 是 WeakMap（按 session 对象身份，快路径），另有有界（500 条）的 `stateById`（按 `session.id`，兜底）。宿主在某些代码路径上会给出不同的 session 实例；只按对象身份索引时，`turn/start` 与 `turn/end` 会落在两份状态上，`sawTurnStart` 恒为 false、判定链整体静默早退（只留一行 `turn/start not observed`）。现在两个索引同时写，`agent/disposed` 时同时清。
 - **补写消息以 `role: 'user'` 落盘**（`source.kind = 'plugin:turn-recovery'`）：宿主 session 层对 `source.kind` 不做枚举校验（只要求非空字符串），插件侧也改不了 role。桌面前端按 `source.kind !== 'user'` 渲染成上下文卡片（不是用户气泡），mnemon 只收录 `source.kind === 'user'`，所以界面与记忆都不受污染；但**会话转录文件里它确实是一条 user 消息**，审计时要看 `source.kind` 区分。另外 `plugin:*` 这个前缀不在宿主 `MessageSourceMap` 的类型联合里 —— 运行时不受影响（前端对未知 kind 走 `default` 分支，显示为「请求」卡片），但下游按类型联合写的消费者会漏掉它。
 - **用户点停止的窗口**：宿主 `cancel()` 只清 inbox + abort，不 append 任何 session 事件。插件订阅了宿主 dispatch 的 `agent/inbox/discarded` 来撤掉自己那条补写，但该事件是否向插件广播取决于宿主的 dispatch 链路；收不到时，「用户已点停止、插件仍在 `delayMs` 后补写」这个窗口依然存在（默认 900ms，可通过 `delayMs` 调小）。真正发出去的那一回合仍受宿主 abort 语义约束。
 - **`sessionScope: 'root'` 的判定依据是宿主的 `Session.header`**：`origin === 'subagent'` 或 `delegationDepth > 0` 才算子代理会话，`orchestrator-*` 这类顶层会话会被正常处理（0.2.0 用 id 前缀判断，把它们全部判成子代理，实测日志里有 19 次静默跳过）。宿主没有 header 的场合（老宿主、测试桩）退回 id 形态：`session-*` / `orchestrator-*` 算根，纯 UUID / `social-*` 不算。被过滤的会话每个 id 只记一条 `skip scope` 日志，不会静默消失。
@@ -134,7 +148,7 @@
 - **多进程（桌面宿主 + 独立的 web/headless 宿主）**：各自一套内存态，`agent.inbox.nextTurn` 只对本进程可见。预算文件与补写 id 文件是共享的，因此限流大致成立，但「同一会话同时被两个宿主打开」仍可能各补一笔。同一会话请只用一个宿主。
 - **`dryRun` 不写预算文件**：判定链、日志、限流检查照走，但不投递、不记账，所以它只能证明「判定会发生」，不能用来验证限流是否生效（日志里的 `budgetUsed=n/max` 是当时的已用额度）。
 - **多宿主共用同一日志文件**：两个进程同时写同一路径时轮转可能失败，此时回退 `truncate(0)` 并记一条 `log rotate fell back to truncate`。
-- **生产环境仍未观测到真实补写**：截至 2026-11-04，本机生产日志里 `nudge DELIVERED` 仍为 0（空回合全部是 `aborted` / `blocked`），所有结论来自单测与 mock 复现。要闭合这一项，请在真机上临时设置 `dryRun: true`，等一次 `completed` 空回合，确认日志出现 `nudge DRY-RUN: would deliver`（判定链在生产成立），再关掉 `dryRun` 等真实投递 —— 这比直接开补写更安全：干跑不会多跑一轮模型。
+- **生产环境仍未观测到真实补写（截至 2026-11-09 复核）**：本机 8 天日志里共 645 个 `turn/end`（`completed` 455 / `error` 165 / `aborted` 25），空回合 182 个 —— 其中 `error` 162、`aborted` 20、`completed` **0**，`nudge SCHEDULED` / `DELIVERED` 也仍是 0。也就是说：唯一要救的那一类（`completed` 却只剩零宽占位符）在本机一次都没发生，出现的全是 `steps=0` 的调用失败（162 次集中在 11-06 / 11-07 两天，属于上游故障；此时补写只会反复撞同一堵墙，所以按设计不补）。所有结论仍来自单测与 mock 复现。要闭合这一项，请在真机上临时设置 `dryRun: true`，等一次 `completed` 空回合，确认日志出现 `nudge DRY-RUN: would deliver`（判定链在生产成立），再关掉 `dryRun` 等真实投递 —— 这比直接开补写更安全：干跑不会多跑一轮模型。看 `stats:` 聚合行可以一眼判断当前处在哪种状态。
 
 ## License
 
