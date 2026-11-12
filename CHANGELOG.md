@@ -7,6 +7,59 @@
 > `@nlflora/dsh-empty-turn-guard`）冲突，自 0.2.0 起更名为 `dsh-turn-recovery`。0.1.x 及更早的条目保留旧名原文，
 > 其提到的 `plugin:empty-turn-guard`、`empty-turn-guard.log` 等标识在 0.2.0 起分别改为 `plugin:turn-recovery`、`turn-recovery.log`。
 
+## [0.2.5] - 2026-11-12
+
+**宿主契约修正版**。三专家评审（架构 / 安全 / 验收）对着宿主 0.2.2-rc.1 的
+`app.asar` 源码与 8 天生产日志复核 0.2.4，查出一个「处理器在真实宿主上永远空转」
+的契约漂移、一条会把模型输出发给第三方的越权路径，以及若干状态文件与路径问题。
+
+### 修复（缺陷）
+
+- **`agent/inbox/discarded` 载荷漂移（P1）**：宿主 0.2.2-rc.1 只发
+  `{ message }`（`dsh-agent-loop/lib/index.js:199`，已从 asar 逐行核实），
+  而 0.2.4 读的是 `payload.agent` → 处理器永远在第一行 `return`：用户点「停止」
+  后待发补写不会被撤销，仍会多跑一个模型回合，且 `DISCARDED by host` 日志永不出现。
+  改为按 `message.id` 反查 `stateById` 中的在途补写，不再依赖载荷里的 agent/session。
+  单测夹具同步改成宿主真实形状（旧夹具自造 `{agent, message}`，所以 65 例全绿也测不到）。
+- **来源闸门（P1）**：新增 `nudgeSources`。`turn/end` 会检查本回合最后一条
+  `user/message` 的 `source.kind`，只有落在白名单（默认 = 前台白名单）才补写。
+  社交桥（`wechat-social-bridge` / `form: relay`）默认被排除：桥接器会把模型输出
+  发回给真人联系人，补写等于**替你对外发言**。
+- **伪造认领不得释放在途标记（P2）**：`clearNudgeInFlight` 原来在「id 不匹配即忽略」
+  之前无条件执行，同进程任一插件 append 一条同 kind、随意 id 的消息就能让守卫
+  多唤醒一次模型。现在只在真的对上 id 时清；过期由 120s 认领超时兜底。
+- **header 缺失时 fail-closed（P2）**：新增 `headerlessScope`，默认 `'out'`（不判定）。
+  旧版按 id 形态把 `session-*` 当根会话，可能给「无 header 的子代理」补写，
+  破坏委派语义。老宿主兼容可显式设 `'root'`。
+- **`sawTurnStart` 不再被误清（P2）**：`turn/start` 缺数值 `turn` 时，
+  后续 `assistant/message` 触发的重置会把 `sawTurnStart` 一并清成 false，
+  整个回合被判成「中途加载」而跳过判定。现在只补记 turn 号、保留 `sawTurnStart`。
+- **`logFile` / `budgetFile` 路径校验（P2）**：自定义路径必须 `.log` 结尾，否则回落默认并记
+  config issue；轮转前检查文件头是否为本插件日志（首字节 `[`），不是就拒绝 rename/truncate ——
+  避免一次配置手滑不可逆地毁掉无关文件。
+- **状态文件压缩（P2）**：`guard-ids.log` 此前只增不减，超 1 MiB 后读侧按字节截断会把
+  TTL 内的旧记录丢掉（晚到认领认不出 → 连环补写）。现在与预算文件同法按 TTL 原子压缩。
+  预算/guard 压缩时若文件里有内容却一条都解析不出来，判定为「不是我们的文件」并拒绝重写。
+
+### 加固
+
+- `stateById` 改为 LRU（命中刷新插入序），避免长跑 >500 会话时把活跃会话按插入序淘汰。
+- 日志压平扩展为 `\r \n U+2028 U+2029 ESC`（部分查看器把前两者当换行、把 ESC 当终端着色）。
+- 状态文件压缩、路径拒绝、来源拦截都会留一行日志，便于现场判定「为什么没补写」。
+
+### 测试
+
+- 65 → 76 例。新增：真实形状的丢弃事件（含陌生 id）、来源闸门（默认拦 / 显式放开）、
+  headerlessScope 两种取值、`sawTurnStart` 补记、guard-ids 压缩、`logFile` 回落、控制字符压平。
+- 测试夹具默认带根会话 header（0.2.5 起无 header 视为范围外），需要测无 header 时传 `__noHeader`。
+
+### 已知遗留
+
+- 「`agent/inbox/discarded` 是否真的广播到插件根 `ctx`」仍**未验证**；
+  收不到时 900ms 停止窗口依然存在（README 已如实标注）。
+- 补写投递 → 认领 → 跨重启去重整条链在真实宿主上仍**零生产证据**
+  （`delivered=0 claimed=0`），需按 README 的 dryRun 流程取证。
+
 ## [0.2.4] - 2026-11-09
 
 **运行期复核版**。0.2.3 之后按 8 天生产日志（645 个 `turn/end`）回头复查代码，

@@ -63,7 +63,10 @@ function makeRig(config = {}, registryAgents = []) {
   apply(ctx, { delayMs: 5, logFile, budgetFile, maxNudgesPerHour: 3, ...config });
   const session = {
     id: config.__sessionId || ('session-' + (1000 + id)),
-    ...(config.__header ? { header: config.__header } : {}),
+    // 生产宿主一定带 SessionHeader（0.2.2-rc.1 实测：header.origin / delegationDepth）。
+    // 0.2.5 起插件对「拿不到 header」改为 fail-closed，所以夹具默认给一个根会话
+    // header；要测无 header 的行为传 __noHeader: true，要指定 header 传 __header。
+    ...(config.__noHeader ? {} : { header: config.__header || { origin: 'session', delegationDepth: 0 } }),
   };
   const agent = {
     session,
@@ -344,7 +347,8 @@ test('热启用：启动时从 agent 注册表回填，无需等 agent/created',
 
 test('session 对象身份不同但 id 相同 → 仍能找到 agent 投递', async () => {
   const rig = makeRig();
-  const clone = { id: rig.session.id }; // 宿主不同路径可能给不同实例
+  // 宿主不同路径可能给不同实例（header 必须一起带上：0.2.5 起无 header 视为范围外）
+  const clone = { id: rig.session.id, header: { origin: 'session', delegationDepth: 0 } };
   const handler = rig.handlers.get('session/event');
   const fireClone = (type, data) => handler(clone, { type, data, seq: ++seq, time: Date.now() });
   fireClone('turn/start', { turn: 40 });
@@ -575,7 +579,7 @@ test('日志 tag 剥掉 session- 前缀（否则所有根会话都是 [session-]
 
 // ---- 0.1.6 回归：两个状态机缺陷 + 停止丢弃 + 日志/配置细节 ----
 
-test('P2-A：同来源但 id 不符的补写消息不算「补写回合」，下一个真空回合仍会补写', async () => {
+test('P2-A：同来源但 id 不符的补写消息被忽略，且不许释放在途标记（0.2.5 收紧）', async () => {
   const rig = makeRig({ delayMs: 5 });
   rig.fire('turn/start', { turn: 70 });
   rig.fire('assistant/message', { turn: 70, step: 1, message: assistant(ZW) });
@@ -583,7 +587,7 @@ test('P2-A：同来源但 id 不符的补写消息不算「补写回合」，下
   await sleep(50);
   assert.equal(rig.sent.length, 1);
 
-  // 一条 plugin 来源但 id 对不上的消息（上次进程遗留 / 重放 / 另一实例写入）
+  // 一条 plugin 来源但 id 对不上的消息（上次进程遗留 / 重放 / 另一实例 / 伪造）
   rig.fire('turn/start', { turn: 71 });
   rig.fire('user/message', guardClaim('some-other-id'));
   rig.fire('assistant/message', { turn: 71, step: 1, message: assistant(ZW) });
@@ -591,7 +595,30 @@ test('P2-A：同来源但 id 不符的补写消息不算「补写回合」，下
   await sleep(50);
   assert.match(rig.log(), /NOT ours/);
   assert.doesNotMatch(rig.log(), /wasGuard=true/);
-  assert.equal(rig.sent.length, 2, 'mismatched claim must not suppress the next real nudge');
+  // 0.2.5：不符的 guard-kind 消息不得释放在途标记 —— 于是第二个空回合被
+  // 「已在途」挡下，而不是再补一笔。旧版在这里先 clear 再早退，任何插件只要
+  // append 一条同 kind、随意 id 的消息，就能让守卫多唤醒一次模型。
+  assert.equal(rig.sent.length, 1, 'mismatched claim must NOT release the in-flight marker');
+  assert.match(rig.log(), /already awaiting claim/);
+  rig.cleanup();
+});
+
+test('0.2.5：对上 id 的认领才释放在途标记；补写回合再空仍按设计停止连环', async () => {
+  const rig = makeRig({ delayMs: 5 });
+  rig.fire('turn/start', { turn: 75 });
+  rig.fire('assistant/message', { turn: 75, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 75, reason: { kind: 'completed' } });
+  await sleep(50);
+  assert.equal(rig.sent.length, 1);
+
+  rig.fire('turn/start', { turn: 76 });
+  rig.fire('user/message', guardClaim(lastSentId(rig)));
+  rig.fire('assistant/message', { turn: 76, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 76, reason: { kind: 'completed' } });
+  await sleep(50);
+  assert.match(rig.log(), /guard message claimed/);
+  assert.match(rig.log(), /stop chaining/);
+  assert.equal(rig.sent.length, 1, 'guard turn that is still empty must not chain');
   rig.cleanup();
 });
 
@@ -788,6 +815,16 @@ test('日志行内的换行被压平：会话 id 不能伪造出一行假日志'
   for (const line of log.trim().split('\n')) {
     assert.match(line, /^\[\d{4}-\d{2}-\d{2}T/, 'every log line must start with a timestamp');
   }
+  rig.cleanup();
+});
+
+test('0.2.5：U+2028 / U+2029 / ESC 也一并压平（部分查看器把它们当换行或着色）', () => {
+  const rig = makeRig({});
+  const evil = { id: 'a\u2028b\u2029c\x1bd' };
+  rig.handlers.get('session/event')(evil, { type: 'turn/start', data: { turn: 1 }, seq: 1, time: Date.now() });
+  const log = rig.log();
+  assert.doesNotMatch(log, /[\u2028\u2029\x1b]/, 'control chars must not reach the log');
+  assert.match(log, /a b c d/);
   rig.cleanup();
 });
 
@@ -1011,7 +1048,7 @@ test('enabled:false + injectInstruction:false → 两项都不做', async () => 
 test('P1-1：session 实例漂移（turn/start 在 A、后续事件在 B）→ 仍判定并补写', async () => {
   const rig = makeRig();
   const handler = rig.handlers.get('session/event');
-  const cloneB = { id: rig.session.id }; // 同一会话，宿主换了实例
+  const cloneB = { id: rig.session.id, header: { origin: 'session', delegationDepth: 0 } }; // 同一会话，宿主换了实例
   const fireOn = (target, type, data) => handler(target, { type, data, seq: ++seq, time: Date.now() });
   fireOn(rig.session, 'turn/start', { turn: 60 });
   fireOn(cloneB, 'assistant/message', { turn: 60, step: 1, message: assistant(ZW) });
@@ -1082,6 +1119,149 @@ test('H1：每 50 个回合打一行聚合 stats，卸载时再打 final', async
   }
   assert.match(rig.log(), /stats: .*\(final\)/);
   rig.cleanup();
+});
+
+// ---- 0.2.5：宿主契约修正（discarded 载荷）/ 来源闸门 / header 兜底 / 状态文件上限 ----
+
+test('0.2.5：宿主只发 { message } 的丢弃事件也能撤掉在途补写（旧版永远读不到）', async () => {
+  const rig = makeRig({ delayMs: 5 });
+  rig.fire('turn/start', { turn: 90 });
+  rig.fire('assistant/message', { turn: 90, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 90, reason: { kind: 'completed' } });
+  await sleep(40);
+  assert.equal(rig.sent.length, 1);
+
+  // 宿主 0.2.2-rc.1 的真实载荷形状：{ message }，没有 agent / session
+  const discard = rig.handlers.get('agent/inbox/discarded');
+  assert.equal(typeof discard, 'function');
+  discard({ message: { id: lastSentId(rig) } });
+  assert.match(rig.log(), /nudge DISCARDED by host before claim/);
+
+  // 释放后在途标记已被清：下一个空回合可以再补一笔
+  rig.fire('turn/start', { turn: 91 });
+  rig.fire('assistant/message', { turn: 91, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 91, reason: { kind: 'completed' } });
+  await sleep(40);
+  assert.equal(rig.sent.length, 2, 'released in-flight must allow a new nudge');
+  rig.cleanup();
+});
+
+test('0.2.5：丢弃事件只认自己的 id（陌生 id 只留一行，不动任何状态）', async () => {
+  const rig = makeRig({ delayMs: 5 });
+  rig.fire('turn/start', { turn: 92 });
+  rig.fire('assistant/message', { turn: 92, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 92, reason: { kind: 'completed' } });
+  await sleep(40);
+  rig.handlers.get('agent/inbox/discarded')({ message: { id: 'someone-else' } });
+  assert.match(rig.log(), /is not an in-flight nudge -> ignored/);
+  assert.doesNotMatch(rig.log(), /DISCARDED by host/);
+  rig.cleanup();
+});
+
+test('0.2.5：来源闸门——桥接会话（不在前台白名单）默认不被补写', async () => {
+  const rig = makeRig({ delayMs: 5 });
+  rig.fire('user/message', {
+    role: 'user',
+    content: [{ type: 'text', text: '微信来的问题' }],
+    source: { kind: 'wechat-social-bridge', form: 'relay' },
+  });
+  rig.fire('turn/start', { turn: 93 });
+  rig.fire('assistant/message', { turn: 93, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 93, reason: { kind: 'completed' } });
+  await sleep(40);
+  assert.equal(rig.sent.length, 0, 'bridge session must not be nudged by default');
+  assert.match(rig.log(), /origin=wechat-social-bridge not in nudge sources/);
+  rig.cleanup();
+});
+
+test('0.2.5：nudgeSources 显式放开后桥接会话才允许补写（自担对外发言）', async () => {
+  const rig = makeRig({ delayMs: 5, nudgeSources: ['wechat-social-bridge'] });
+  rig.fire('user/message', {
+    role: 'user',
+    content: [{ type: 'text', text: '微信来的问题' }],
+    source: { kind: 'wechat-social-bridge', form: 'relay' },
+  });
+  rig.fire('turn/start', { turn: 94 });
+  rig.fire('assistant/message', { turn: 94, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 94, reason: { kind: 'completed' } });
+  await sleep(40);
+  assert.equal(rig.sent.length, 1);
+  rig.cleanup();
+});
+
+test('0.2.5：无 SessionHeader 时默认不判定（fail-closed）', async () => {
+  const rig = makeRig({ delayMs: 5, __noHeader: true });
+  rig.fire('turn/start', { turn: 95 });
+  rig.fire('assistant/message', { turn: 95, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 95, reason: { kind: 'completed' } });
+  await sleep(30);
+  assert.equal(rig.sent.length, 0);
+  assert.match(rig.log(), /headerlessScope=out/);
+  rig.cleanup();
+});
+
+test('0.2.5：headerlessScope:"root" 恢复旧行为（老宿主兼容，显式开启）', async () => {
+  const rig = makeRig({ delayMs: 5, __noHeader: true, headerlessScope: 'root' });
+  rig.fire('turn/start', { turn: 96 });
+  rig.fire('assistant/message', { turn: 96, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 96, reason: { kind: 'completed' } });
+  await sleep(40);
+  assert.equal(rig.sent.length, 1);
+  assert.match(rig.log(), /scope fallback: no header, id shape=root/);
+  rig.cleanup();
+});
+
+test('0.2.5：turn/start 缺数值 turn 时，assistant/message 不得清掉 sawTurnStart', async () => {
+  const rig = makeRig({ delayMs: 5 });
+  rig.fire('turn/start', {}); // turn 缺失：s.turn 保持 null
+  rig.fire('assistant/message', { turn: 97, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 97, reason: { kind: 'completed' } });
+  await sleep(40);
+  assert.equal(rig.sent.length, 1, 'turn/start was seen: the turn must still be judged');
+  assert.doesNotMatch(rig.log(), /turn\/start not observed/);
+  rig.cleanup();
+});
+
+test('0.2.5：guard-ids.log 超过上限会按 TTL 压缩（不再只增不减）', async () => {
+  const rig = makeRig({ delayMs: 5 });
+  const now = Date.now();
+  const lines = [];
+  for (let i = 0; i < 20000; i += 1) {
+    lines.push(JSON.stringify({ sid: 'session-old-' + (i % 50), id: 'id-' + i, at: now - 1000 }));
+  }
+  fs.writeFileSync(rig.guardFile, lines.join('\n') + '\n');
+  const before = fs.statSync(rig.guardFile).size;
+  assert.ok(before > 1024 * 1024, 'fixture must exceed the cap');
+
+  rig.fire('turn/start', { turn: 98 });
+  rig.fire('assistant/message', { turn: 98, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 98, reason: { kind: 'completed' } });
+  await sleep(40);
+
+  const after = fs.statSync(rig.guardFile).size;
+  assert.ok(after < before, 'guard ids file must shrink after compaction');
+  assert.match(rig.log(), /guard ids compacted/);
+  rig.cleanup();
+});
+
+test('0.2.5：logFile 不像日志路径 → 回落默认并记 config issue', () => {
+  const prev = process.env.DSH_HOME;
+  const home = path.join(os.tmpdir(), 'etg-home-' + process.pid + '-' + (++seq));
+  fs.mkdirSync(home, { recursive: true });
+  process.env.DSH_HOME = home;
+  try {
+    const rig = makeRig({ logFile: path.join(home, 'notes.txt') });
+    // 自定义路径被拒 → 实际写到 <DSH_HOME>/logs/turn-recovery.log；
+    // rig.log() 读的仍是被拒的那个路径，所以这里直接读兜底文件。
+    const fallback = path.join(home, 'logs', 'turn-recovery.log');
+    assert.ok(fs.existsSync(fallback), 'falls back to DSH_HOME');
+    assert.match(fs.readFileSync(fallback, 'utf8'), /"logFile" must end with \.log -> default used/);
+    rig.cleanup();
+  } finally {
+    if (prev === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = prev;
+    try { fs.rmSync(home, { recursive: true, force: true }); } catch { /* ignore */ }
+  }
 });
 
 let failed = 0;

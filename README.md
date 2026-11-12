@@ -64,8 +64,12 @@
     maxNudgesPerHour: 3      # 每会话每小时的补写上限（0 = 关闭补写）
     sessionScope: root       # root = 只处理根会话（按 SessionHeader 判定）；all = 连子代理会话一起
     foregroundKinds: []      # 追加「会取消待发补写」的来源 kind（默认 user / agent-message）
+    nudgeSources: []         # 允许被补写的「回合发起来源」；空 = 沿用 foregroundKinds
+                             # 社交桥（wechat-social-bridge 等）默认**不在**其中：模型输出
+                             # 可能被转发给第三方联系人，补写等于替你对外发言
+    headerlessScope: out     # 会话无 SessionHeader 时的判定：out = 不碰（默认）；root = 沿用旧版 id 形态猜
     budgetFile: ''           # 空 = <DSH_HOME>/state/turn-recovery/nudges.log（跨重启限流）
-                             # 同目录还会写 guard-ids.log（跨重启认出晚到认领的补写 id）
+                             # 必须 .log 结尾；同目录还会写 guard-ids.log（跨重启认出晚到认领的补写 id）
     logFile: ''              # 空 = <DSH_HOME>/logs/turn-recovery.log
     logTurns: empty          # empty = 只记空回合/被跳过判定的回合；all = 连正常回合也记
     dryRun: false            # true = 判定/限流/日志全部照走，但不真的投递（验证用）
@@ -121,7 +125,7 @@
 
 `version=` 是进程里真正加载的版本号（从包自身 `package.json` 读）——**升级后先看这一行**，不要靠「某个日志字段有没有」推断跑的是哪一版（0.1.4 与 0.1.5 都打过 `sawStart`，这个推断会错）。
 
-排查常用短语：`config issue`（配置写错，插件仍启用）、`skip scope`（被 `sessionScope` 过滤掉的会话，括号里写明是 `header says subagent` 还是 `id is not a root shape`）、`guard NOT armed (fail-closed`（同名 prompt 段落已被占用，插件整体不启用，不再谎报 armed）、`inbox already holds a pending turn-recovery nudge`（队列里已有一笔，未重复投递）、`turn/start not observed`（热加载中途，不判定）、`NOT ours`（同来源但 id 对不上，已忽略）、`LATE, from guardIds`（认领超时后才到，仍按补写回合处理）、`DISCARDED by host`（用户停止，补写被丢弃）、`a nudge is already awaiting claim`（上一笔还没被认领）、`skipped:in-flight`（本回合没排上，因为上一笔仍在途 —— 不算「已补过」）、`turn N already handled`（该回合确实排过或确实被限流）、`DROPPED: turn moved on`（定时器到点时会话已进入下一回合）、`stop chaining`（补写回合又空，按设计不再连环）、`budget exhausted`（本小时额度用完）。
+排查常用短语：`config issue`（配置写错，插件仍启用）、`skip scope`（被 `sessionScope` 过滤掉的会话，括号里写明是 `header says subagent` 还是 `no header (headerlessScope=out)`）、`scope fallback`（`headerlessScope: 'root'` 时靠 id 形态放行的会话，首次记一行）、`guard NOT armed (fail-closed`（同名 prompt 段落已被占用，插件整体不启用，不再谎报 armed）、`inbox already holds a pending turn-recovery nudge`（队列里已有一笔，未重复投递）、`turn/start not observed`（热加载中途，不判定）、`NOT ours`（同来源但 id 对不上，已忽略；0.2.5 起不再因此清在途标记）、`LATE, from guardIds`（认领超时后才到，仍按补写回合处理）、`DISCARDED by host`（用户停止，补写被丢弃）、`is not an in-flight nudge`（丢弃事件里的 id 不是我们的在途补写）、`origin=… not in nudge sources`（来源闸门拦下的空回合，例如社交桥）、`a nudge is already awaiting claim`（上一笔还没被认领）、`skipped:in-flight`（本回合没排上，因为上一笔仍在途 —— 不算「已补过」）、`turn N already handled`（该回合确实排过或确实被限流）、`DROPPED: turn moved on`（定时器到点时会话已进入下一回合）、`stop chaining`（补写回合又空，按设计不再连环）、`budget exhausted`（本小时额度用完）、`guard ids compacted` / `budget compact skipped`（状态文件压缩结果）、`log rotate skipped: file does not look like`（`logFile` 配到了别的文件，拒绝轮转它）。
 
 ## 实现约束
 
@@ -139,11 +143,12 @@
 ## 已知限制
 
 - **会话状态是双索引**：`state` 是 WeakMap（按 session 对象身份，快路径），另有有界（500 条）的 `stateById`（按 `session.id`，兜底）。宿主在某些代码路径上会给出不同的 session 实例；只按对象身份索引时，`turn/start` 与 `turn/end` 会落在两份状态上，`sawTurnStart` 恒为 false、判定链整体静默早退（只留一行 `turn/start not observed`）。现在两个索引同时写，`agent/disposed` 时同时清。
+- **补写只在「人类发起」的回合里发生（0.2.5 来源闸门）**：`turn/end` 会检查本回合最后一条 `user/message` 的 `source.kind`，只有落在 `nudgeSources`（默认等于前台白名单 `user` / `agent-message`）里才补写。原因是社交桥（`source.kind='wechat-social-bridge'`, `form='relay'`）这类会话里，桥接器会把模型输出发回给真实的微信/QQ 联系人 —— 插件往这种会话塞一句"请直接输出纯文本"，等于**替你对外发言**。需要给桥接对话也保留保护时，把该 kind 写进 `nudgeSources` 显式开启。本回合没有 `user/message`（拿不到来源）时按"无法判定"放行，日志里能看到判定过程。
 - **补写消息以 `role: 'user'` 落盘**（`source.kind = 'plugin:turn-recovery'`）：宿主 session 层对 `source.kind` 不做枚举校验（只要求非空字符串），插件侧也改不了 role。桌面前端按 `source.kind !== 'user'` 渲染成上下文卡片（不是用户气泡），mnemon 只收录 `source.kind === 'user'`，所以界面与记忆都不受污染；但**会话转录文件里它确实是一条 user 消息**，审计时要看 `source.kind` 区分。另外 `plugin:*` 这个前缀不在宿主 `MessageSourceMap` 的类型联合里 —— 运行时不受影响（前端对未知 kind 走 `default` 分支，显示为「请求」卡片），但下游按类型联合写的消费者会漏掉它。
-- **用户点停止的窗口**：宿主 `cancel()` 只清 inbox + abort，不 append 任何 session 事件。插件订阅了宿主 dispatch 的 `agent/inbox/discarded` 来撤掉自己那条补写，但该事件是否向插件广播取决于宿主的 dispatch 链路；收不到时，「用户已点停止、插件仍在 `delayMs` 后补写」这个窗口依然存在（默认 900ms，可通过 `delayMs` 调小）。真正发出去的那一回合仍受宿主 abort 语义约束。
-- **`sessionScope: 'root'` 的判定依据是宿主的 `Session.header`**：`origin === 'subagent'` 或 `delegationDepth > 0` 才算子代理会话，`orchestrator-*` 这类顶层会话会被正常处理（0.2.0 用 id 前缀判断，把它们全部判成子代理，实测日志里有 19 次静默跳过）。宿主没有 header 的场合（老宿主、测试桩）退回 id 形态：`session-*` / `orchestrator-*` 算根，纯 UUID / `social-*` 不算。被过滤的会话每个 id 只记一条 `skip scope` 日志，不会静默消失。
+- **用户点停止的窗口**：宿主 `cancel()` 只清 inbox + abort，不 append 任何 session 事件。插件订阅宿主的 `agent/inbox/discarded` 来撤掉自己那条补写。0.2.4 及更早读的是 `payload.agent`，而宿主 0.2.2-rc.1 实际只发 `{ message }`（`dsh-agent-loop/lib/index.js:199`），于是处理器永远在第一行 return —— 0.2.5 改为按 `message.id` 反查在途补写，真实形状下才会真的撤掉定时器。**仍未验证**的是：该事件是否向插件的根 `ctx` 广播（宿主在自己的 `ownerCtx` 上监听 `agent/disposed`，说明 agent 作用域事件存在）。收不到时，「用户已点停止、插件仍在 `delayMs` 后补写」这个窗口依然存在（默认 900ms，可通过 `delayMs` 调小）。真正发出去的那一回合仍受宿主 abort 语义约束。
+- **`sessionScope: 'root'` 的判定依据是宿主的 `Session.header`**：`origin === 'subagent'` 或 `delegationDepth > 0` 才算子代理会话，`orchestrator-*` 这类顶层会话会被正常处理（0.2.0 用 id 前缀判断，把它们全部判成子代理，实测日志里有 19 次静默跳过）。**0.2.5 起**：拿不到 header 时默认**不判定**（`headerlessScope: 'out'`，fail-closed）—— 旧版按 id 形态把 `session-*` / `orchestrator-*` 当根会话，于是「无 header 的子代理」也会被补写，往子代理里塞"不要调用工具"会破坏委派语义。确有老宿主需要兼容时显式设 `headerlessScope: 'root'`（首次放行会记一行 `scope fallback`）。被过滤的会话每个 id 只记一条 `skip scope` 日志，不会静默消失。
 - **可见字符是「按回合累计」而不是「末条消息」**：一个回合里先写了结论、后来又被工具调用打断的，累计口径下不算空（这是刻意的：用户此前已经看到了文字）。反过来，`aborted` / `interrupted` 等非 `completed` 回合一律不补写，即使它确实没留下正文 —— 那些回合多半是用户自己喊停的，再补一轮会变成「已取消还继续跑」。
-- **崩溃遗留**：补写已入队但宿主在认领前崩溃时，该消息可能在下次启动被重放。插件只认 id 匹配的认领（`NOT ours`），因此不会被这种消息骗成「补写回合」，但它仍可能作为一条插件消息出现在转录里。为覆盖「120s 认领超时后才被认领」与「重启后才被认领」两种情形，最近 8 条投递 id 会同时留在内存与 `<budgetFile 同目录>/guard-ids.log` 里（`LATE, from guardIds`），重启后仍能认出它们，不会把补写回合再当成真空回合补第二笔。
+- **崩溃遗留**：补写已入队但宿主在认领前崩溃时，该消息可能在下次启动被重放。插件只认 id 匹配的认领（`NOT ours`），因此不会被这种消息骗成「补写回合」，但它仍可能作为一条插件消息出现在转录里。为覆盖「120s 认领超时后才被认领」与「重启后才被认领」两种情形，最近 8 条投递 id 会同时留在内存与 `<budgetFile 同目录>/guard-ids.log` 里（`LATE, from guardIds`），重启后仍能认出它们，不会把补写回合再当成真空回合补第二笔。**0.2.5 起**该文件超过 1 MiB 会按 TTL 原子压缩（`guard ids compacted: lines=N`）—— 旧版只增不减，而且读侧按字节截断会把 TTL 内的旧记录丢掉，反而让「晚到认领」认不出。
 - **预算文件是不可信输入**：解析时会丢弃「晚于当前时钟 +5 分钟」的时间戳（否则 `now - t` 为负、该会话被永久判成预算耗尽），并且整份文件只在 1 MiB 以内整读、超过就只读尾部（避免配置写错指向几百 MB 的文件时同步阻塞宿主）。写入用 JSON 行（会话 id 含空格也不会被截断），压缩是「重读磁盘 + 临时文件原子替换」，不会覆盖另一个进程刚追加的行。
 - **多进程（桌面宿主 + 独立的 web/headless 宿主）**：各自一套内存态，`agent.inbox.nextTurn` 只对本进程可见。预算文件与补写 id 文件是共享的，因此限流大致成立，但「同一会话同时被两个宿主打开」仍可能各补一笔。同一会话请只用一个宿主。
 - **`dryRun` 不写预算文件**：判定链、日志、限流检查照走，但不投递、不记账，所以它只能证明「判定会发生」，不能用来验证限流是否生效（日志里的 `budgetUsed=n/max` 是当时的已用额度）。
