@@ -1264,6 +1264,105 @@ test('0.2.5：logFile 不像日志路径 → 回落默认并记 config issue', (
   }
 });
 
+// ---- 0.2.6：新版宿主契约（runtime-context 快照 / nudgeKinds / 计数复位） ----
+
+test('0.2.6：宿主在人类消息后追加 runtime-context → 仍然补写（P0 回归）', async () => {
+  // 宿主 dsh-agent-loop 的固定顺序：先 append 人类消息，再 append 运行时上下文快照
+  // （source.kind='runtime-context' / form='snapshot'，时间在变所以每回合都会重发）。
+  // 0.2.5 会把 turnOrigin 覆盖成 'runtime-context'，于是空回合判定通过后又被闸门拦下。
+  const rig = makeRig();
+  rig.fire('turn/start', { turn: 11 });
+  rig.fire('user/message', human('帮我看下这个报错'));
+  rig.fire('user/message', runtimeContext());
+  rig.fire('assistant/message', { turn: 11, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 11, reason: { kind: 'completed' } });
+  await sleep(60);
+  assert.equal(rig.sent.length, 1, 'runtime-context must not override turnOrigin');
+  assert.ok(!/origin=runtime-context/.test(rig.log()), 'runtime-context must never become the origin');
+  rig.cleanup();
+});
+
+test('0.2.6：只有 runtime-context（没人说话）的空回合 → 不补写', async () => {
+  const rig = makeRig();
+  rig.fire('turn/start', { turn: 12 });
+  rig.fire('user/message', runtimeContext());
+  rig.fire('assistant/message', { turn: 12, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 12, reason: { kind: 'completed' } });
+  await sleep(60);
+  assert.equal(rig.sent.length, 0);
+  assert.match(rig.log(), /origin=runtime-context not in nudge sources/);
+  rig.cleanup();
+});
+
+test('0.2.6：只有 form:"notice" 的通知回合 → 不补写（0.2.5 会 fail-open 放行）', async () => {
+  const rig = makeRig();
+  rig.fire('turn/start', { turn: 13 });
+  rig.fire('user/message', {
+    role: 'user',
+    content: [{ type: 'text', text: '[工具任务完成]' }],
+    source: { kind: 'user', form: 'notice' },
+  });
+  rig.fire('assistant/message', { turn: 13, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 13, reason: { kind: 'completed' } });
+  await sleep(60);
+  assert.equal(rig.sent.length, 0, 'notice is not a human turn');
+  assert.match(rig.log(), /origin=user not in nudge sources/);
+  rig.cleanup();
+});
+
+test('0.2.6：turn/start 缺失的回合不再继承上一回合计数（P1 回归）', async () => {
+  const rig = makeRig({ logTurns: 'all' });
+  rig.fire('turn/start', { turn: 1 });
+  rig.fire('user/message', human('写点东西'));
+  rig.fire('assistant/message', { turn: 1, step: 1, message: assistant('这是一段正文') });
+  rig.fire('turn/end', { turn: 1, reason: { kind: 'completed' } });
+  // 回合 2 没有 turn/start、也没有任何 assistant 消息：这才是真的空回合。
+  // 旧版沿用 turn 1 的 visibleChars/steps，把它判成非空并静默跳过。
+  rig.fire('turn/end', { turn: 2, reason: { kind: 'completed' } });
+  await sleep(60);
+  assert.equal(rig.sent.length, 1, 'turn 2 must be judged empty');
+  assert.match(rig.log(), /turn=2 kind=completed steps=0 visibleChars=0 empty=true/);
+  rig.cleanup();
+});
+
+test('0.2.6：nudgeKinds 默认只含 completed；显式放开后 error 空回合才补写', async () => {
+  const strict = makeRig();
+  strict.fire('turn/start', { turn: 7 });
+  strict.fire('user/message', human());
+  strict.fire('assistant/message', { turn: 7, step: 1, message: assistant(ZW) });
+  strict.fire('turn/end', { turn: 7, reason: { kind: 'error' } });
+  await sleep(50);
+  assert.equal(strict.sent.length, 0);
+  assert.match(strict.log(), /kind=error not in nudgeKinds/);
+  strict.cleanup();
+
+  const loose = makeRig({ nudgeKinds: ['completed', 'error'] });
+  loose.fire('turn/start', { turn: 7 });
+  loose.fire('user/message', human());
+  loose.fire('assistant/message', { turn: 7, step: 1, message: assistant(ZW) });
+  loose.fire('turn/end', { turn: 7, reason: { kind: 'error' } });
+  await sleep(60);
+  assert.equal(loose.sent.length, 1);
+  loose.cleanup();
+});
+
+test('0.2.6：nudgeKinds 写错（非数组/空数组）→ 记 config issue 并回落默认', async () => {
+  const notArray = makeRig({ nudgeKinds: 'completed' });
+  assert.match(notArray.log(), /"nudgeKinds" expects an array/);
+  notArray.cleanup();
+  const empty = makeRig({ nudgeKinds: [] });
+  assert.match(empty.log(), /"nudgeKinds" is empty/);
+  empty.cleanup();
+});
+
+test('0.2.6：host api 自检行带上放行集合与允许的原因', async () => {
+  const rig = makeRig();
+  assert.match(rig.log(), /host api: systemPrompt\.section=ok session\/event=ok/);
+  assert.match(rig.log(), /nudgeKinds=completed/);
+  assert.match(rig.log(), /nudgeSources=user\|agent-message/);
+  rig.cleanup();
+});
+
 let failed = 0;
 for (const c of cases) {
   try {
@@ -1277,4 +1376,17 @@ for (const c of cases) {
 }
 console.log('');
 console.log(failed === 0 ? 'all ' + cases.length + ' cases passed' : failed + ' of ' + cases.length + ' cases failed');
+
+// 兜底清理（0.2.6）：个别用例在断言失败时会跳过 cleanup()，把 tmp 里的夹具留着。
+// 只删本进程自己的（名字里带 process.pid），不会碰别人或其他进程的文件。
+try {
+  const tmp = os.tmpdir();
+  const mine = ['etg-test-' + process.pid + '-', 'etg-state-' + process.pid + '-'];
+  for (const name of fs.readdirSync(tmp)) {
+    if (mine.some((prefix) => name.startsWith(prefix))) {
+      fs.rmSync(path.join(tmp, name), { recursive: true, force: true });
+    }
+  }
+} catch { /* 清理失败不影响测试结论 */ }
+
 process.exit(failed === 0 ? 0 : 1);

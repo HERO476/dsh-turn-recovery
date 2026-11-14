@@ -7,6 +7,60 @@
 > `@nlflora/dsh-empty-turn-guard`）冲突，自 0.2.0 起更名为 `dsh-turn-recovery`。0.1.x 及更早的条目保留旧名原文，
 > 其提到的 `plugin:empty-turn-guard`、`empty-turn-guard.log` 等标识在 0.2.0 起分别改为 `plugin:turn-recovery`、`turn-recovery.log`。
 
+## [0.2.6] - 2026-11-14
+
+**新版宿主契约破裂版**。对着 DSH **0.2.2-rc.3**（`app.asar` 内实际加载的运行时）
+逐条核对事件形状后，查出 0.2.5 的**来源闸门在真实宿主上把每一个空回合都拦掉了** ——
+功能整体失效，而 76 个单测全绿，因为单测没有复现宿主「每回合追加运行时上下文」的行为。
+
+### 修复（缺陷）
+
+- **来源闸门被 `runtime-context` 覆盖（P0，功能整体失效）**：宿主 `dsh-agent-loop`
+  在人类消息之后会 append 一条 `user/message`，其 `source = { kind: 'runtime-context',
+  form: 'snapshot' }`（时间在变，几乎每回合都重发）。0.2.5 的
+  `if (form !== 'notice') s.turnOrigin = kind` 每见到一条就覆盖，于是
+  `turnOrigin` 恒等于 `runtime-context`，空回合判定通过后被闸门拦下，
+  **补写永不发生**。生产日志三周 `emptyCompleted=0 / delivered=0 / claimed=0`。
+  改为：`turnOrigin` 只在来源落在放行集合里时记录，且**首个优先**、后面的不覆盖；
+  另用 `lastSourceKind` 保留"实际拦截的是谁"用于日志。
+- **`form:'notice'` 回合 fail-open（P1）**：旧版对 `turnOrigin === ''` 一律放行，
+  于是「只有通知形态消息」的回合（`form:'notice'`）会被补写。现在一旦本回合见过
+  带 `source.kind` 的消息、却没有一条在放行集合里，就 fail-closed。
+  完全没见过消息的回合（罕见的内部回合）仍按旧行为放行，日志留痕。
+- **回合计数不随回合复位（P1，静默漏判）**：`visibleChars / assistantMessages /
+  sawTurnStart` 只在 `turn/start` 里清零。`turn/start` 没被看到的回合会沿用上一回合
+  的计数：真的空回合被判成"非空"（漏补写），`sawTurnStart` 也停在 true，
+  使"中途加载不判定"的保护同时失效。实测日志：`turn=2 … steps=1 visibleChars=27`，
+  而该回合一条 assistant 消息都没有。现在 `turn/end` 先整体快照、**立刻复位**计数再判定；
+  `s.turn` 以 `turn/end` 为准（缺 `turn/start` 时它落后一整回合，会让定时器的
+  "回合已前进"检查把刚排的补写当成过期丢弃）。
+- **复核 `turn/start` 缺失的语义（P1）**：新增 `everSawTurnStart`。本会话从未见过
+  `turn/start` → 仍按"中途加载"跳过（fail-closed）；之前见过 → 视为事件丢失，
+  用已复位的计数正常判定，不再整回合白漏一次补写。
+- **新增 `nudgeKinds` 配置（P2，产品决定显式化）**：默认 `['completed']`。
+  生产日志里 695 个 `turn/end` 有 200 个是空回合，全部是 `aborted` / `error` / `blocked`，
+  而旧版只处理 `completed` —— 也就是说这套逻辑在本机三周内 0 次命中目标场景。
+  是否给中断/报错回合补写是产品决定，现在把它做成配置：放开 `'aborted'` 等于
+  "用户按了停止之后插件还会再唤醒一轮模型"，默认绝不打开。
+- **新增 `SUSPICIOUS` 防御日志（P3）**：非空判定却没有任何 assistant 消息时记一行，
+  用于发现"visibleChars 来自别处"这类回归。正常路径零成本。
+- **启动自检行（P2）**：加载时打一行 `host api: systemPrompt.section=ok session/event=ok
+  nudgeKinds=… nudgeSources=…`，跨小版本加载出问题时不必先读源码猜哪一步没接上。
+
+### 变更
+
+- `engines.dsh` 上界从 `<0.3.0-0` 放宽到 `<0.4.0-0`：旧上界会在 DSH 升到 0.3 时
+  让 pnpm 直接拒绝装载 bundle（表现为插件**静默消失**）。跨 0.4 仍需重新适配。
+- 单测 76 → **83** 例：新增 runtime-context 覆盖、纯上下文/纯 notice 回合、
+  `turn/start` 缺失的计数复位、`nudgeKinds` 默认与放开、配置写错、启动自检。
+
+### 已知未验证（如实记录）
+
+- `agent/inbox/discarded` 在真实点「停止」时是否到达 `ctx.on`：源码形状已核对，
+  运行期未抓到实例。
+- 生产转录为 `session.v4.jsonl.zstd`，未解压核对 runtime-context 的落盘顺序；
+  结论依据宿主源码（`dsh-agent-loop` 的 append 顺序）+ 灰盒复现 + 插件自身日志。
+
 ## [0.2.5] - 2026-11-12
 
 **宿主契约修正版**。三专家评审（架构 / 安全 / 验收）对着宿主 0.2.2-rc.1 的
