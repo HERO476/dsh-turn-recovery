@@ -41,6 +41,7 @@ function makeRig(config = {}, registryAgents = []) {
   const guardFile = path.join(stateDir, 'guard-ids.log');
   const sections = [];
   const handlers = new Map();
+  let sawUserThisTurn = false;
   const effects = [];
   const sent = [];
   const ctx = {
@@ -81,7 +82,21 @@ function makeRig(config = {}, registryAgents = []) {
   const fire = (type, data) => {
     const fn = handlers.get('session/event');
     if (typeof fn !== 'function') throw new Error('插件未订阅 session/event（enabled=false？）');
+    // 0.2.7：allowOriginless 默认 fail-closed 之后，夹具必须体现「这个回合是人发起的」。
+    // 真实宿主顺序是 turn/start 先、user/message 后；这里在 turn/end 之前补一条人类消息，
+    // 只在整回合**一条 user/message 都没有**时才补 —— 于是
+    //   · 「零宽空回合」这类夹具仍然是人类回合（应当补写）；
+    //   · 「只有 runtime-context / 只有 notice / 桥接」这类夹具保持原样（不该补写）；
+    //   · 要测「完全没有消息」的回合，传 __autoHuman: false。
+    // 注意：不在 turn/start 重置 —— 宿主的 user/message 也可能先于 turn/start 到达
+    // （桥接/排队场景），那仍然算「本回合有人说话」。
+    if (type === 'user/message') sawUserThisTurn = true;
+    if (type === 'turn/end' && config.__autoHuman !== false && !sawUserThisTurn) {
+      sawUserThisTurn = true;
+      fn(session, { type: 'user/message', data: human(), seq: ++seq, time: Date.now() });
+    }
     fn(session, { type, data, seq: ++seq, time: Date.now() });
+    if (type === 'turn/end') sawUserThisTurn = false;
   };
   const log = () => { try { return fs.readFileSync(logFile, 'utf8'); } catch { return ''; } };
   const cleanup = () => {
@@ -352,6 +367,7 @@ test('session 对象身份不同但 id 相同 → 仍能找到 agent 投递', as
   const handler = rig.handlers.get('session/event');
   const fireClone = (type, data) => handler(clone, { type, data, seq: ++seq, time: Date.now() });
   fireClone('turn/start', { turn: 40 });
+  fireClone('user/message', human());
   fireClone('assistant/message', { turn: 40, step: 1, message: assistant(ZW) });
   fireClone('turn/end', { turn: 40, reason: { kind: 'completed' } });
   await sleep(60);
@@ -599,7 +615,9 @@ test('P2-A：同来源但 id 不符的补写消息被忽略，且不许释放在
   // 「已在途」挡下，而不是再补一笔。旧版在这里先 clear 再早退，任何插件只要
   // append 一条同 kind、随意 id 的消息，就能让守卫多唤醒一次模型。
   assert.equal(rig.sent.length, 1, 'mismatched claim must NOT release the in-flight marker');
-  assert.match(rig.log(), /already awaiting claim/);
+  // 0.2.7：这条伪造消息的来源不在放行集合里，会先被来源闸门拦下（更早、更安全）；
+  // 若闸门放行，则由「已在途」拦下。两种都满足"不发第二笔"。
+  assert.match(rig.log(), /no nudge/);
   rig.cleanup();
 });
 
@@ -634,7 +652,7 @@ test('P2-B：turn/end 缺少数值 turn 时也要清掉 awaitingGuardTurn（否�
   rig.fire('user/message', guardClaim(lastSentId(rig)));
   rig.fire('turn/end', { turn: '81', reason: { kind: 'completed' } }); // 缺少数值 turn
   await sleep(20);
-  assert.match(rig.log(), /skip judgement \(state reset\)/);
+  assert.match(rig.log(), /skip judgement \(counters\+origin reset\)/);
 
   // 下一个真正的空回合必须还能补写（旧版会 stop chaining 静默跳过）
   rig.fire('turn/start', { turn: 82 });
@@ -1051,6 +1069,7 @@ test('P1-1：session 实例漂移（turn/start 在 A、后续事件在 B）→ �
   const cloneB = { id: rig.session.id, header: { origin: 'session', delegationDepth: 0 } }; // 同一会话，宿主换了实例
   const fireOn = (target, type, data) => handler(target, { type, data, seq: ++seq, time: Date.now() });
   fireOn(rig.session, 'turn/start', { turn: 60 });
+  fireOn(cloneB, 'user/message', human());
   fireOn(cloneB, 'assistant/message', { turn: 60, step: 1, message: assistant(ZW) });
   fireOn(cloneB, 'turn/end', { turn: 60, reason: { kind: 'completed' } });
   await sleep(60);
@@ -1170,7 +1189,7 @@ test('0.2.5：来源闸门——桥接会话（不在前台白名单）默认不
   rig.fire('turn/end', { turn: 93, reason: { kind: 'completed' } });
   await sleep(40);
   assert.equal(rig.sent.length, 0, 'bridge session must not be nudged by default');
-  assert.match(rig.log(), /origin=wechat-social-bridge not in nudge sources/);
+  assert.match(rig.log(), /origin=\(none\).*not in nudge sources/);
   rig.cleanup();
 });
 
@@ -1290,7 +1309,7 @@ test('0.2.6：只有 runtime-context（没人说话）的空回合 → 不补写
   rig.fire('turn/end', { turn: 12, reason: { kind: 'completed' } });
   await sleep(60);
   assert.equal(rig.sent.length, 0);
-  assert.match(rig.log(), /origin=runtime-context not in nudge sources/);
+  assert.match(rig.log(), /lastSource=runtime-context not in nudge sources/);
   rig.cleanup();
 });
 
@@ -1306,7 +1325,7 @@ test('0.2.6：只有 form:"notice" 的通知回合 → 不补写（0.2.5 会 fai
   rig.fire('turn/end', { turn: 13, reason: { kind: 'completed' } });
   await sleep(60);
   assert.equal(rig.sent.length, 0, 'notice is not a human turn');
-  assert.match(rig.log(), /origin=user not in nudge sources/);
+  assert.match(rig.log(), /lastSource=user not in nudge sources/);
   rig.cleanup();
 });
 
@@ -1360,6 +1379,120 @@ test('0.2.6：host api 自检行带上放行集合与允许的原因', async () 
   assert.match(rig.log(), /host api: systemPrompt\.section=ok session\/event=ok/);
   assert.match(rig.log(), /nudgeKinds=completed/);
   assert.match(rig.log(), /nudgeSources=user\|agent-message/);
+  rig.cleanup();
+});
+
+// ---- 0.2.7：本轮修复的六条 + 两条可观测性 ----
+
+test('0.2.7：nudgeSources 是追加语义——配了桥接，人类回合仍能补写', async () => {
+  const rig = makeRig({ delayMs: 5, nudgeSources: ['wechat-social-bridge'] });
+  rig.fire('turn/start', { turn: 201 });
+  rig.fire('user/message', human());
+  rig.fire('assistant/message', { turn: 201, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 201, reason: { kind: 'completed' } });
+  await sleep(60);
+  assert.equal(rig.sent.length, 1, 'nudgeSources must extend, not replace');
+  rig.cleanup();
+});
+
+test('0.2.7：retry（点重新生成）也是人类回合 → 空回合要补写', async () => {
+  const rig = makeRig({ delayMs: 5, __autoHuman: false });
+  rig.fire('turn/start', { turn: 202 });
+  rig.fire('user/message', { role: 'user', content: [{ type: 'text', text: '重新生成' }], source: { kind: 'retry' } });
+  rig.fire('assistant/message', { turn: 202, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 202, reason: { kind: 'completed' } });
+  await sleep(60);
+  assert.equal(rig.sent.length, 1);
+  rig.cleanup();
+});
+
+test('0.2.7：缺 turn 的 turn/end 之后，goal 回合不得被当成人类回合补写', async () => {
+  const rig = makeRig({ delayMs: 5, __autoHuman: false });
+  rig.fire('turn/start', { turn: 203 });
+  rig.fire('user/message', human());
+  rig.fire('assistant/message', { turn: 203, step: 1, message: assistant('有正文') });
+  rig.fire('turn/end', {});
+  rig.fire('turn/start', { turn: 204 });
+  rig.fire('user/message', { role: 'user', content: [{ type: 'text', text: '自动化目标回合' }], source: { kind: 'goal' } });
+  rig.fire('assistant/message', { turn: 204, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 204, reason: { kind: 'completed' } });
+  await sleep(80);
+  assert.equal(rig.sent.length, 0, 'goal turn must not inherit the previous human origin');
+  assert.doesNotMatch(rig.log(), /\(state reset\)/);
+  rig.cleanup();
+});
+
+test('0.2.7：max-tokens（正文被烧光）默认也补写', async () => {
+  const rig = makeRig({ delayMs: 5 });
+  rig.fire('turn/start', { turn: 205 });
+  rig.fire('user/message', human());
+  rig.fire('assistant/message', { turn: 205, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 205, reason: { kind: 'max-tokens' } });
+  await sleep(60);
+  assert.equal(rig.sent.length, 1);
+  rig.cleanup();
+});
+
+test('0.2.7：完全没有 user/message 的回合默认不补写，allowOriginless 才放行', async () => {
+  const strict = makeRig({ delayMs: 5, __autoHuman: false });
+  strict.fire('turn/start', { turn: 206 });
+  strict.fire('turn/end', { turn: 206, reason: { kind: 'completed' } });
+  await sleep(50);
+  assert.equal(strict.sent.length, 0);
+  assert.match(strict.log(), /no user\/message at all/);
+  strict.cleanup();
+
+  const loose = makeRig({ delayMs: 5, __autoHuman: false, allowOriginless: true });
+  loose.fire('turn/start', { turn: 206 });
+  loose.fire('turn/end', { turn: 206, reason: { kind: 'completed' } });
+  await sleep(60);
+  assert.equal(loose.sent.length, 1);
+  loose.cleanup();
+});
+
+test('0.2.7：agent 在 delayMs 内 disposed → 提前 flush，不再静默消失', async () => {
+  const rig = makeRig({ delayMs: 300 });
+  rig.fire('turn/start', { turn: 207 });
+  rig.fire('user/message', human());
+  rig.fire('assistant/message', { turn: 207, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 207, reason: { kind: 'completed' } });
+  await sleep(60);
+  assert.match(rig.log(), /nudge SCHEDULED/);
+  assert.doesNotMatch(rig.log(), /DELIVERED/);
+  rig.handlers.get('agent/disposed')({ agent: rig.agent });
+  await sleep(60);
+  // 关键：短命会话必须有结论行。夹具的 agent 在 disposed 时仍可调用，
+  // 所以这里能真的救回这一笔；真实宿主可能已不可投递，那时会记 error/lost。
+  assert.match(rig.log(), /nudge FLUSH on agent dispose -> (delivered|skipped|error)/);
+  assert.equal(rig.sent.length, 1, 'flush should deliver while the agent is still reachable');
+  // 卸载时打 final stats：scheduled 与 delivered 必须配平（0.2.7 记账的目的）。
+  for (const eff of rig.effects) { const dispose = eff(); if (typeof dispose === 'function') dispose(); }
+  assert.match(rig.log(), /stats: .*scheduled=1 .*delivered=1/);
+  rig.cleanup();
+});
+
+test('0.2.7：未知 reason.kind 每个只报一次 CONTRACT DRIFT', async () => {
+  const rig = makeRig({ delayMs: 5 });
+  rig.fire('turn/start', { turn: 208 });
+  rig.fire('user/message', human());
+  rig.fire('turn/end', { turn: 208, reason: { kind: 'something-new' } });
+  rig.fire('turn/start', { turn: 209 });
+  rig.fire('user/message', human());
+  rig.fire('turn/end', { turn: 209, reason: { kind: 'something-new' } });
+  await sleep(40);
+  const hits = (rig.log().match(/CONTRACT DRIFT/g) || []).length;
+  assert.equal(hits, 1, 'drift must be reported once per kind');
+  rig.cleanup();
+});
+
+test('0.2.7：闸门日志把 origin 与 lastSource 分开写', async () => {
+  const rig = makeRig({ delayMs: 5, __autoHuman: false });
+  rig.fire('turn/start', { turn: 210 });
+  rig.fire('user/message', runtimeContext());
+  rig.fire('assistant/message', { turn: 210, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 210, reason: { kind: 'completed' } });
+  await sleep(40);
+  assert.match(rig.log(), /origin=\(none\) lastSource=runtime-context/);
   rig.cleanup();
 });
 

@@ -64,11 +64,16 @@
     maxNudgesPerHour: 3      # 每会话每小时的补写上限（0 = 关闭补写）
     sessionScope: root       # root = 只处理根会话（按 SessionHeader 判定）；all = 连子代理会话一起
     foregroundKinds: []      # 追加「会取消待发补写」的来源 kind（默认 user / agent-message）
-    nudgeSources: []         # 允许被补写的「回合发起来源」；空 = 沿用 foregroundKinds
+    nudgeSources: []         # **追加**到默认人类来源（user/agent-message/retry/
+                             # user-question-reply/skill-invocation/session-reference）之上
                              # 社交桥（wechat-social-bridge 等）默认**不在**其中：模型输出
                              # 可能被转发给第三方联系人，补写等于替你对外发言
-    nudgeKinds: [completed]  # 允许补写的 turn/end 原因（0.2.6）。默认只补 completed；
-                             # 放开 aborted/error 等于「用户按了停止也会再唤醒一轮」，谨慎
+    nudgeKinds: [completed, max-tokens]  # 允许补写的 turn/end 原因（0.2.7 起含 max-tokens，
+                             # 即正文被推理/长度烧光的截断回合）；放开 aborted/error 等于
+                             # 「用户按了停止也会再唤醒一轮」，谨慎
+    allowOriginless: false   # 完全没有 user/message 的回合要不要补写（0.2.7）。默认关：
+                             # 宿主 step0 无消息会直接 completed，放行等于往"用户没说过话
+                             # 的回合"插一条 role:'user'
     headerlessScope: out     # 会话无 SessionHeader 时的判定：out = 不碰（默认）；root = 沿用旧版 id 形态猜
     budgetFile: ''           # 空 = <DSH_HOME>/state/turn-recovery/nudges.log（跨重启限流）
                              # 必须 .log 结尾；同目录还会写 guard-ids.log（跨重启认出晚到认领的补写 id）
@@ -127,7 +132,7 @@
 
 `version=` 是进程里真正加载的版本号（从包自身 `package.json` 读）——**升级后先看这一行**，不要靠「某个日志字段有没有」推断跑的是哪一版（0.1.4 与 0.1.5 都打过 `sawStart`，这个推断会错）。
 
-排查常用短语：`config issue`（配置写错，插件仍启用）、`skip scope`（被 `sessionScope` 过滤掉的会话，括号里写明是 `header says subagent` 还是 `no header (headerlessScope=out)`）、`scope fallback`（`headerlessScope: 'root'` 时靠 id 形态放行的会话，首次记一行）、`guard NOT armed (fail-closed`（同名 prompt 段落已被占用，插件整体不启用，不再谎报 armed）、`inbox already holds a pending turn-recovery nudge`（队列里已有一笔，未重复投递）、`turn/start not observed`（热加载中途，不判定）、`NOT ours`（同来源但 id 对不上，已忽略；0.2.5 起不再因此清在途标记）、`LATE, from guardIds`（认领超时后才到，仍按补写回合处理）、`DISCARDED by host`（用户停止，补写被丢弃）、`is not an in-flight nudge`（丢弃事件里的 id 不是我们的在途补写）、`origin=… not in nudge sources`（来源闸门拦下的空回合，例如社交桥 / 纯 runtime-context / 纯 notice）、`kind=… not in nudgeKinds`（该回合原因不在允许补写的集合里，例如 aborted / error）、`turn/start missing for turn N`（事件丢失但计数是干净的，仍会判定）、`SUSPICIOUS: turn=N`（判成非空却没有任何 assistant 消息，说明计数有回归）、`host api: …`（加载自检，`MISSING` 表示宿主接口对不上）、`a nudge is already awaiting claim`（上一笔还没被认领）、`skipped:in-flight`（本回合没排上，因为上一笔仍在途 —— 不算「已补过」）、`turn N already handled`（该回合确实排过或确实被限流）、`DROPPED: turn moved on`（定时器到点时会话已进入下一回合）、`stop chaining`（补写回合又空，按设计不再连环）、`budget exhausted`（本小时额度用完）、`guard ids compacted` / `budget compact skipped`（状态文件压缩结果）、`log rotate skipped: file does not look like`（`logFile` 配到了别的文件，拒绝轮转它）。
+排查常用短语：`config issue`（配置写错，插件仍启用）、`skip scope`（被 `sessionScope` 过滤掉的会话，括号里写明是 `header says subagent` 还是 `no header (headerlessScope=out)`）、`scope fallback`（`headerlessScope: 'root'` 时靠 id 形态放行的会话，首次记一行）、`guard NOT armed (fail-closed`（同名 prompt 段落已被占用，插件整体不启用，不再谎报 armed）、`inbox already holds a pending turn-recovery nudge`（队列里已有一笔，未重复投递）、`turn/start not observed`（热加载中途，不判定）、`NOT ours`（同来源但 id 对不上，已忽略；0.2.5 起不再因此清在途标记）、`LATE, from guardIds`（认领超时后才到，仍按补写回合处理）、`DISCARDED by host`（用户停止，补写被丢弃）、`is not an in-flight nudge`（丢弃事件里的 id 不是我们的在途补写）、`origin=… lastSource=… not in nudge sources`（来源闸门拦下的空回合，例如社交桥 / 纯 runtime-context / 纯 notice；0.2.7 起两个字段分开写）、`empty turn with no user/message at all`（整回合没有任何来源消息，默认不补写，见 `allowOriginless`）、`nudge FLUSH on agent dispose`（agent 在 delayMs 内被销毁，提前投递的结果）、`nudge LOST`（排上却没落地：定时器被替换、或截止时刻已过；`stats` 的 `lost` 与它对应）、`CONTRACT DRIFT`（宿主出现了未知的 `reason.kind`，每个 kind 只报一次）、`kind=… not in nudgeKinds`（该回合原因不在允许补写的集合里，例如 aborted / error）、`turn/start missing for turn N`（事件丢失但计数是干净的，仍会判定）、`SUSPICIOUS: turn=N`（判成非空却没有任何 assistant 消息，说明计数有回归）、`host api: …`（加载自检，`MISSING` 表示宿主接口对不上）、`a nudge is already awaiting claim`（上一笔还没被认领）、`skipped:in-flight`（本回合没排上，因为上一笔仍在途 —— 不算「已补过」）、`turn N already handled`（该回合确实排过或确实被限流）、`DROPPED: turn moved on`（定时器到点时会话已进入下一回合）、`stop chaining`（补写回合又空，按设计不再连环）、`budget exhausted`（本小时额度用完）、`guard ids compacted` / `budget compact skipped`（状态文件压缩结果）、`log rotate skipped: file does not look like`（`logFile` 配到了别的文件，拒绝轮转它）。
 
 ## 实现约束
 
@@ -145,7 +150,14 @@
 ## 已知限制
 
 - **会话状态是双索引**：`state` 是 WeakMap（按 session 对象身份，快路径），另有有界（500 条）的 `stateById`（按 `session.id`，兜底）。宿主在某些代码路径上会给出不同的 session 实例；只按对象身份索引时，`turn/start` 与 `turn/end` 会落在两份状态上，`sawTurnStart` 恒为 false、判定链整体静默早退（只留一行 `turn/start not observed`）。现在两个索引同时写，`agent/disposed` 时同时清。
-- **补写只在「人类发起」的回合里发生（0.2.6 来源闸门）**：`turn/end` 会检查本回合的 `source.kind`，只有落在 `nudgeSources`（默认等于前台白名单 `user` / `agent-message`）里才补写。原因是社交桥（`source.kind='wechat-social-bridge'`, `form='relay'`）这类会话里，桥接器会把模型输出发回给真实的微信/QQ 联系人 —— 插件往这种会话塞一句"请直接输出纯文本"，等于**替你对外发言**。需要给桥接对话也保留保护时，把该 kind 写进 `nudgeSources` 显式开启。
+- **补写只在「人类发起」的回合里发生（0.2.7 来源闸门）**：`turn/end` 会检查本回合的 `source.kind`，只有落在 `nudgeSources`（默认等于前台白名单 `user` / `agent-message`）里才补写。原因是社交桥（`source.kind='wechat-social-bridge'`, `form='relay'`）这类会话里，桥接器会把模型输出发回给真实的微信/QQ 联系人 —— 插件往这种会话塞一句"请直接输出纯文本"，等于**替你对外发言**。需要给桥接对话也保留保护时，把该 kind 写进 `nudgeSources` 显式开启。
+
+  0.2.7 修掉两处语义错误：`nudgeSources` 原来是**替换**集合（一旦配置，人类来源 `user` 就不在其中，
+  所有人类回合被 fail-closed 拦掉），现在改为**追加**；「这是不是人类回合」与「允许哪个渠道
+  产生对外副作用」原先合成同一个集合，于 `retry`（点重新生成）、`user-question-reply`、
+  `skill-invocation`、`session-reference` 这些同样由人触发的回合被误拦，现在拆成
+  `DEFAULT_NUDGE_SOURCES` 与"越权侧效果"两个判断。未见过任何 user/message 的回合默认
+  **不补写**（`allowOriginless: false`），要恢复旧行为需显式打开。
 
   0.2.5 的写法有两个洞，0.2.6 都补上了：① 宿主 `dsh-agent-loop` 在人类消息之后会 append 一条 `source.kind='runtime-context'` / `form='snapshot'` 的运行时上下文快照（时间在变，几乎每回合都重发），旧版每见到一条非 `notice` 消息就覆盖 `turnOrigin`，于是它恒等于 `runtime-context` —— 空回合判定通过后被闸门拦掉，**补写永不发生**（DSH 0.2.2-rc.3 上实测如此）。现在只记录落在放行集合里、且是本回合**首个**的来源。② 旧版对空来源一律放行，于是「只有 `form:'notice'` 通知」的回合也会被补写；现在见过带来源的消息却一条都不在放行集合里就 fail-closed。完全没见过带来源消息的回合（罕见的内部回合）仍按旧行为放行，日志会写明 `origin=(none)`。
 - **补写消息以 `role: 'user'` 落盘**（`source.kind = 'plugin:turn-recovery'`）：宿主 session 层对 `source.kind` 不做枚举校验（只要求非空字符串），插件侧也改不了 role。桌面前端按 `source.kind !== 'user'` 渲染成上下文卡片（不是用户气泡），mnemon 只收录 `source.kind === 'user'`，所以界面与记忆都不受污染；但**会话转录文件里它确实是一条 user 消息**，审计时要看 `source.kind` 区分。另外 `plugin:*` 这个前缀不在宿主 `MessageSourceMap` 的类型联合里 —— 运行时不受影响（前端对未知 kind 走 `default` 分支，显示为「请求」卡片），但下游按类型联合写的消费者会漏掉它。

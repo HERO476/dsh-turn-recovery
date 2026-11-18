@@ -7,6 +7,75 @@
 > `@nlflora/dsh-empty-turn-guard`）冲突，自 0.2.0 起更名为 `dsh-turn-recovery`。0.1.x 及更早的条目保留旧名原文，
 > 其提到的 `plugin:empty-turn-guard`、`empty-turn-guard.log` 等标识在 0.2.0 起分别改为 `plugin:turn-recovery`、`turn-recovery.log`。
 
+## [0.2.7] - 2026-11-18
+
+**补写链闭环版**。三专家评审（架构 / 安全 / 验收）在 DSH **0.2.2-rc.3** 上复核 0.2.6：
+判定层确实修对了（人类消息 + runtime-context 快照的回合恢复补写），但**端到端仍是 0 成功**
+——生产日志 `scheduled=5 / delivered=2 / claimed=0`，而那 2 次 DELIVERED 出自复现会话。
+本轮把补写链上的静默断点全部补上，并修掉 0.2.6 暴露的两处闸门语义错误。
+
+### 修复（缺陷）
+
+- **补写在 delayMs 窗口内被静默丢弃（P0）**：`agent/disposed` 里还写着
+  `clearTimer(s, null)` —— `why` 为空不写日志，于是「排上却被清掉」与「还在等」在日志里
+  完全同形。生产实证：`2026-11-18T03:32:56 / 03:39:21 / 03:44:31Z` 三条
+  `nudge SCHEDULED … [mnemon-r]` 之后再无任何一行（同一 pid 42128 全程存活，已排除进程退出）。
+  现在 disposed 会先**提前 flush**（agent 尚可调用时把这一笔真的投出去），
+  失败/无事可做才记 lost；`clearTimer` 一律带原因并计 `cancelled`。
+- **定时器被替换时静默 return（P0）**：`if (s.timer !== timer) return;` 是第二个无日志出口，
+  现在记 `nudge LOST: timer superseded` 并计数。
+- **`nudgeSources` 是替换语义 → 一配就全灭（P0）**：`extra.length > 0 ? new Set(extra) : null`
+  让放行集合只剩用户写进去的 kind，人类来源 `user` 不在其中，于是**所有人类回合被
+  fail-closed 拦掉**（探针：`sent=0`，期望 1）。改为**追加**语义。
+- **「人类回合」与「允许外部副作用」被合成一个集合（P1）**：闸门原本只认
+  `user` / `agent-message`，而 `retry`（点"重新生成"）、`user-question-reply`、
+  `skill-invocation`、`session-reference` 同样由人触发（宿主 MessageSourceMap 共 25 种来源），
+  这些回合的空正文会被当成可疑来源忽略。新增 `DEFAULT_NUDGE_SOURCES` 明确"人在说话"的来源集合。
+- **`turn/end` 缺 `turn` 时闸门状态跨回合泄漏（P1）**：快照+复位原本在 `turn === null`
+  早退**之后**，于是 `turnOrigin / sawUserMessage / lastSourceKind` 被带进下一回合，
+  一个 `goal` / `schedule` / 桥接回合可能被误判成人类回合去补写（0.2.5 想封的越权侧效果），
+  而日志还写 `state reset`，与事实相反。现在先快照+复位再早退，日志改
+  `counters+origin reset`。
+- **`max-tokens` 漏在默认集合外（P1）**：正文被推理/长度烧光是**最贴近目标**的空白场景
+  （宿主 `dsh-agent-loop:970`），0.2.6 默认只补 `completed`。实测 216 个空回合里
+  `completed` 只有 7 个（3.2%），其余 175 个 `error`、33 个 `aborted`、1 个 `blocked`、
+  加 7 个 `completed` —— 默认集合现在含 `max-tokens`；`aborted/error/blocked` 仍默认关。
+- **零消息回合 fail-open（P1）**：宿主 `agent-loop:765-768` 在 step0 无消息时直接以
+  `completed` 结束本回合，这条路真实可达；旧版对「没见到来源」一律放行，等于往
+  「用户没说过话的回合」插一条 `role:'user'`。新增 `allowOriginless`（默认 `false`）。
+
+### 加固
+
+- **补写回合检查前移**：`wasGuard`（补写回合又空 → 停止连环）提到来源闸门之前。
+  补写消息的来源是 `plugin:turn-recovery`，不在放行集合里，先过闸门会被拦成
+  `origin=(none)`，反而丢掉「停止连环」的语义。
+- **CONTRACT DRIFT 自检**：`turn/end` 遇到未知 `reason.kind` 时每个 kind 报一行
+  —— `engines.dsh` 已放宽到 `<0.4.0-0`，跨版本不能只靠"pnpm 会拦"。
+- **跨进程锁**：`<state>/nudge.lock`（`O_EXCL`，TTL=`delayMs+2s`）。
+  同 profile 被两个宿主同时挂载时，进程内的 `nudgeMessageId` 各算各的，会出现双发。
+- **补写消息带 token**：`source.token` 落进消息（仅作**可疑标记**，不否决 late 认领 ——
+  认领超时后 token 可能已被新一笔覆盖，用它否决会让真实晚到认领被当成陌生消息而连环补写）。
+- **日志把 `origin` 与 `lastSource` 分开**：0.2.6 混用同一个字段，误报成
+  `origin=runtime-context`，害过一轮排查。
+- **stats 配平**：`scheduled / delivered / claimed / cancelled / dropped / lost` 六个计数，
+  每个 SCHEDULED 都必须有终态行，final 里能一眼看出"排了几笔、没落地几笔"。
+- **启动自检行补 `allowOriginless` 与 `state=<dir>`**：未隔离 `budgetFile` 的 harness
+  会把测试数据写进生产 state（本轮复核就发生过，已清理）。
+
+### 变更
+
+- 单测 83 → **91** 例：新增 0.2.7 六条回归（nudgeSources 追加、retry 回合、
+  缺 turn 后 goal 回合、max-tokens、allowOriginless、disposed flush）+ 两条可观测性
+  （CONTRACT DRIFT 去重、日志字段分离）。夹具新增 `__autoHuman`：整回合一条 user/message
+  都没有时自动补一条人类消息，让 `allowOriginless` 的默认 fail-closed 不影响既有用例。
+
+### 已知未验证（如实记录）
+
+- 真实宿主点「停止」时 `agent/inbox/discarded` 是否到达根 `ctx`：形状已核对，运行期未抓到。
+- `mnemon-r` 会话为何在 900ms 内结束：已排除进程退出（同一 pid 存活），剩 disposed 与事件顺序两种。
+- 0.3.x 无运行体可测；跨小版本只能靠 `host api` 自检行 + `CONTRACT DRIFT` 观察。
+- 首页 UI 是否把补写渲染成"用户气泡"：未在网页端实机确认。
+
 ## [0.2.6] - 2026-11-14
 
 **新版宿主契约破裂版**。对着 DSH **0.2.2-rc.3**（`app.asar` 内实际加载的运行时）
