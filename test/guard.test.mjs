@@ -1450,7 +1450,7 @@ test('0.2.7：完全没有 user/message 的回合默认不补写，allowOriginle
   loose.cleanup();
 });
 
-test('0.2.7：agent 在 delayMs 内 disposed → 提前 flush，不再静默消失', async () => {
+test('0.3.0：agent 在 delayMs 内 disposed → 记 lost，绝不往死会话投递', async () => {
   const rig = makeRig({ delayMs: 300 });
   rig.fire('turn/start', { turn: 207 });
   rig.fire('user/message', human());
@@ -1461,13 +1461,31 @@ test('0.2.7：agent 在 delayMs 内 disposed → 提前 flush，不再静默消�
   assert.doesNotMatch(rig.log(), /DELIVERED/);
   rig.handlers.get('agent/disposed')({ agent: rig.agent });
   await sleep(60);
-  // 关键：短命会话必须有结论行。夹具的 agent 在 disposed 时仍可调用，
-  // 所以这里能真的救回这一笔；真实宿主可能已不可投递，那时会记 error/lost。
-  assert.match(rig.log(), /nudge FLUSH on agent dispose -> (delivered|skipped|error)/);
-  assert.equal(rig.sent.length, 1, 'flush should deliver while the agent is still reachable');
-  // 卸载时打 final stats：scheduled 与 delivered 必须配平（0.2.7 记账的目的）。
+  // 0.3.0 语义变更：0.2.7 在这里「提前 flush」，把补写投进正在销毁的 agent，
+  // send() 不抛即记 delivered —— 消息永久挂在该会话 inbox.next-turn，
+  // 生产日志 claimed 恒为 0（两天两次，跨宿主重启都没被消费）。
+  // 现在明确不投递，只记 lost：宁可少补一笔，也不伪造 delivered。
+  assert.match(rig.log(), /nudge LOST: agent disposed before delivery/);
+  assert.equal(rig.sent.length, 0, 'a disposed agent must never receive a nudge');
+  assert.doesNotMatch(rig.log(), /nudge DELIVERED/);
+  assert.doesNotMatch(rig.log(), /nudge FLUSH on agent dispose/);
+  // 卸载时打 final stats：scheduled 必须有终态，且 lost 记账为 1。
   for (const eff of rig.effects) { const dispose = eff(); if (typeof dispose === 'function') dispose(); }
-  assert.match(rig.log(), /stats: .*scheduled=1 .*delivered=1/);
+  assert.match(rig.log(), /stats: .*scheduled=1 delivered=0 claimed=0 cancelled=0 dropped=0 lost=1/);
+  rig.cleanup();
+});
+
+test('0.3.0：dispose 之后即使定时器仍在，deliver 也不会投递', async () => {
+  const rig = makeRig({ delayMs: 5 });
+  rig.fire('turn/start', { turn: 210 });
+  rig.fire('user/message', human());
+  rig.fire('assistant/message', { turn: 210, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 210, reason: { kind: 'completed' } });
+  // 定时器还没跑就先 dispose：disposedSessions 必须在投递前挡住。
+  rig.handlers.get('agent/disposed')({ agent: rig.agent });
+  await sleep(60);
+  assert.equal(rig.sent.length, 0, 'no delivery after dispose');
+  assert.doesNotMatch(rig.log(), /nudge DELIVERED/);
   rig.cleanup();
 });
 
@@ -1493,6 +1511,141 @@ test('0.2.7：闸门日志把 origin 与 lastSource 分开写', async () => {
   rig.fire('turn/end', { turn: 210, reason: { kind: 'completed' } });
   await sleep(40);
   assert.match(rig.log(), /origin=\(none\) lastSource=runtime-context/);
+  rig.cleanup();
+});
+
+// ---- 0.3.0：评审修复项的回归 ----
+
+test('0.3.0：foregroundKinds 只管取消语义，不再顺带授予补写许可（授权回归）', async () => {
+  // 0.2.7 把 foregroundKinds 并进 allowedOrigins：一个只想「桥接消息能取消待发补写」
+  // 的 profile，会因此让桥接会话被自动插话，模型输出经桥接发给真人第三方。
+  const relay = () => ({
+    role: 'user',
+    content: [{ type: 'text', text: '微信来的消息' }],
+    source: { kind: 'wechat-social-bridge', form: 'relay' },
+  });
+  const rig = makeRig({ delayMs: 5, __autoHuman: false, foregroundKinds: ['wechat-social-bridge'] });
+  rig.fire('turn/start', { turn: 1 });
+  rig.fire('user/message', relay());
+  rig.fire('assistant/message', { turn: 1, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 1, reason: { kind: 'completed' } });
+  await sleep(40);
+  assert.equal(rig.sent.length, 0, 'relay session must not receive an automatic line');
+  assert.match(rig.log(), /not in nudge sources -> no nudge/);
+  rig.cleanup();
+});
+
+test('0.3.0：后台生产者命名空间（mnemon-review-*）默认不补写', async () => {
+  // 这些会话用 source:{kind:"user"} 写入，source 判据看不出区别；
+  // 会话 id 的命名空间是更硬的判据。
+  const rig = makeRig({ delayMs: 5, __sessionId: 'mnemon-review-v1-abcdef01' });
+  rig.fire('turn/start', { turn: 4 });
+  rig.fire('user/message', human());
+  rig.fire('assistant/message', { turn: 4, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 4, reason: { kind: 'completed' } });
+  await sleep(40);
+  assert.equal(rig.sent.length, 0);
+  assert.match(rig.log(), /background producer namespace/);
+  rig.cleanup();
+});
+
+test('0.3.0：backgroundSessionPatterns: [] 可关掉后台命名空间拒绝', async () => {
+  const rig = makeRig({ delayMs: 5, __sessionId: 'mnemon-review-v1-abcdef02', backgroundSessionPatterns: [] });
+  rig.fire('turn/start', { turn: 5 });
+  rig.fire('user/message', human());
+  rig.fire('assistant/message', { turn: 5, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 5, reason: { kind: 'completed' } });
+  await sleep(40);
+  assert.equal(rig.sent.length, 1, 'explicitly cleared patterns must restore the old behaviour');
+  rig.cleanup();
+});
+
+test('0.3.0：工具 concludeTurn 收尾的回合判空也不补写（计划评审取消场景）', async () => {
+  const rig = makeRig({ delayMs: 5 });
+  rig.fire('turn/start', { turn: 6 });
+  rig.fire('user/message', human());
+  rig.fire('tool/call', { turn: 6, name: 'exit_plan_mode' });
+  rig.fire('tool/result', { turn: 6, name: 'exit_plan_mode', result: { concludesTurn: true } });
+  rig.fire('assistant/message', { turn: 6, step: 1, message: assistant(null, true) });
+  rig.fire('turn/end', { turn: 6, reason: { kind: 'completed' } });
+  await sleep(40);
+  assert.equal(rig.sent.length, 0, 'a tool-concluded turn must not wake another model round');
+  assert.match(rig.log(), /a tool concluded this turn -> no nudge/);
+  rig.cleanup();
+});
+
+test('0.3.0：nudgeSkipTools 命中的工具回合不补写', async () => {
+  const rig = makeRig({ delayMs: 5, nudgeSkipTools: ['exit_plan_mode'], nudgeSkipConcludedTurns: false });
+  rig.fire('turn/start', { turn: 7 });
+  rig.fire('user/message', human());
+  rig.fire('tool/call', { turn: 7, name: 'exit_plan_mode' });
+  rig.fire('assistant/message', { turn: 7, step: 1, message: assistant(null, true) });
+  rig.fire('turn/end', { turn: 7, reason: { kind: 'completed' } });
+  await sleep(40);
+  assert.equal(rig.sent.length, 0);
+  assert.match(rig.log(), /is in nudgeSkipTools/);
+  rig.cleanup();
+});
+
+test('0.3.0：budgetFile 指向外部日志 → 不写、不压缩、不落 guard-ids.log', async () => {
+  const prevHome = process.env.DSH_HOME;
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'etg-home-' + process.pid + '-'));
+  process.env.DSH_HOME = home;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'etg-foreign-' + process.pid + '-'));
+  const foreign = path.join(dir, 'audit.log');
+  const body = 'someone else wrote this\n' + JSON.stringify({ id: 'x', at: Date.now() }) + '\n';
+  fs.writeFileSync(foreign, body);
+  try {
+    const rig = makeRig({ delayMs: 5, budgetFile: foreign });
+    rig.fire('turn/start', { turn: 8 });
+    rig.fire('user/message', human());
+    rig.fire('assistant/message', { turn: 8, step: 1, message: assistant(ZW) });
+    rig.fire('turn/end', { turn: 8, reason: { kind: 'completed' } });
+    await sleep(60);
+    assert.equal(rig.sent.length, 1, 'nudging still works; only persistence degrades');
+    assert.equal(fs.readFileSync(foreign, 'utf8'), body, 'foreign file must stay byte-identical');
+    assert.equal(fs.existsSync(path.join(dir, 'guard-ids.log')), false,
+      'must not create state files next to a foreign file');
+    assert.match(rig.log(), /state file NOT owned by turn-recovery/);
+    rig.cleanup();
+  } finally {
+    if (prevHome === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = prevHome;
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('0.3.0：日志 tag 12 位 —— mnemon-run-v1 与 mnemon-review-v1 不再同名', async () => {
+  // 8 位时两者都截成 "mnemon-r"，日志无法区分（评审时因此出现两位专家各指认不同会话）。
+  // 12 位分别是 "mnemon-run-v" 与 "mnemon-revie"。
+  const run = makeRig({ delayMs: 5, __sessionId: 'mnemon-run-v1-aaaa1111', backgroundSessionPatterns: [] });
+  run.fire('turn/start', { turn: 9 });
+  run.fire('user/message', human());
+  run.fire('assistant/message', { turn: 9, step: 1, message: assistant(ZW) });
+  run.fire('turn/end', { turn: 9, reason: { kind: 'completed' } });
+  await sleep(40);
+  assert.match(run.log(), /\[mnemon-run-v\]/);
+  run.cleanup();
+
+  const review = makeRig({ delayMs: 5, __sessionId: 'mnemon-review-v1-bbbb2222', backgroundSessionPatterns: [] });
+  review.fire('turn/start', { turn: 10 });
+  review.fire('user/message', human());
+  review.fire('assistant/message', { turn: 10, step: 1, message: assistant(ZW) });
+  review.fire('turn/end', { turn: 10, reason: { kind: 'completed' } });
+  await sleep(40);
+  assert.match(review.log(), /\[mnemon-revie\]/);
+  review.cleanup();
+});
+
+test('0.3.0：宿主 interrupted（崩溃遗留回合）不再误报 CONTRACT DRIFT', async () => {
+  const rig = makeRig({ delayMs: 5 });
+  rig.fire('turn/start', { turn: 11 });
+  rig.fire('user/message', human());
+  rig.fire('turn/end', { turn: 11, reason: { kind: 'interrupted' } });
+  await sleep(40);
+  assert.doesNotMatch(rig.log(), /CONTRACT DRIFT/);
+  assert.equal(rig.sent.length, 0, 'interrupted is not in nudgeKinds by default');
   rig.cleanup();
 });
 

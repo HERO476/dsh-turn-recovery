@@ -75,8 +75,15 @@
                              # 宿主 step0 无消息会直接 completed，放行等于往"用户没说过话
                              # 的回合"插一条 role:'user'
     headerlessScope: out     # 会话无 SessionHeader 时的判定：out = 不碰（默认）；root = 沿用旧版 id 形态猜
+    backgroundSessionPatterns: [mnemon-run-, mnemon-review-, mnemon-idle-]  # 0.3.0：后台生产者
+                             # 的会话 id 前缀，命中即不补写（它们用 source:{kind:'user'} 写入，
+                             # 单看 source 分不出来）。[] = 关闭该拒绝
+    nudgeSkipTools: []       # 0.3.0：本回合调用过这些工具就不补写（如 exit_plan_mode）
+    nudgeSkipConcludedTurns: true  # 0.3.0：工具返回 concludesTurn 时回合是"被工具收尾"的，
+                             # 判空也不补写（计划评审被取消时就是这条路径）
     budgetFile: ''           # 空 = <DSH_HOME>/state/turn-recovery/nudges.log（跨重启限流）
-                             # 必须 .log 结尾；同目录还会写 guard-ids.log（跨重启认出晚到认领的补写 id）
+                             # 必须 .log 结尾。0.3.0 起：若指向**已存在且不属于本插件**的文件
+                             # （首行不是本插件标记），插件不写、不压缩、不备份，只记一次告警
     logFile: ''              # 空 = <DSH_HOME>/logs/turn-recovery.log
     logTurns: empty          # empty = 只记空回合/被跳过判定的回合；all = 连正常回合也记
     dryRun: false            # true = 判定/限流/日志全部照走，但不真的投递（验证用）
@@ -132,7 +139,7 @@
 
 `version=` 是进程里真正加载的版本号（从包自身 `package.json` 读）——**升级后先看这一行**，不要靠「某个日志字段有没有」推断跑的是哪一版（0.1.4 与 0.1.5 都打过 `sawStart`，这个推断会错）。
 
-排查常用短语：`config issue`（配置写错，插件仍启用）、`skip scope`（被 `sessionScope` 过滤掉的会话，括号里写明是 `header says subagent` 还是 `no header (headerlessScope=out)`）、`scope fallback`（`headerlessScope: 'root'` 时靠 id 形态放行的会话，首次记一行）、`guard NOT armed (fail-closed`（同名 prompt 段落已被占用，插件整体不启用，不再谎报 armed）、`inbox already holds a pending turn-recovery nudge`（队列里已有一笔，未重复投递）、`turn/start not observed`（热加载中途，不判定）、`NOT ours`（同来源但 id 对不上，已忽略；0.2.5 起不再因此清在途标记）、`LATE, from guardIds`（认领超时后才到，仍按补写回合处理）、`DISCARDED by host`（用户停止，补写被丢弃）、`is not an in-flight nudge`（丢弃事件里的 id 不是我们的在途补写）、`origin=… lastSource=… not in nudge sources`（来源闸门拦下的空回合，例如社交桥 / 纯 runtime-context / 纯 notice；0.2.7 起两个字段分开写）、`empty turn with no user/message at all`（整回合没有任何来源消息，默认不补写，见 `allowOriginless`）、`nudge FLUSH on agent dispose`（agent 在 delayMs 内被销毁，提前投递的结果）、`nudge LOST`（排上却没落地：定时器被替换、或截止时刻已过；`stats` 的 `lost` 与它对应）、`CONTRACT DRIFT`（宿主出现了未知的 `reason.kind`，每个 kind 只报一次）、`kind=… not in nudgeKinds`（该回合原因不在允许补写的集合里，例如 aborted / error）、`turn/start missing for turn N`（事件丢失但计数是干净的，仍会判定）、`SUSPICIOUS: turn=N`（判成非空却没有任何 assistant 消息，说明计数有回归）、`host api: …`（加载自检，`MISSING` 表示宿主接口对不上）、`a nudge is already awaiting claim`（上一笔还没被认领）、`skipped:in-flight`（本回合没排上，因为上一笔仍在途 —— 不算「已补过」）、`turn N already handled`（该回合确实排过或确实被限流）、`DROPPED: turn moved on`（定时器到点时会话已进入下一回合）、`stop chaining`（补写回合又空，按设计不再连环）、`budget exhausted`（本小时额度用完）、`guard ids compacted` / `budget compact skipped`（状态文件压缩结果）、`log rotate skipped: file does not look like`（`logFile` 配到了别的文件，拒绝轮转它）。
+排查常用短语：`config issue`（配置写错，插件仍启用）、`skip scope`（被 `sessionScope` 过滤掉的会话，括号里写明是 `header says subagent` 还是 `no header (headerlessScope=out)`）、`scope fallback`（`headerlessScope: 'root'` 时靠 id 形态放行的会话，首次记一行）、`guard NOT armed (fail-closed`（同名 prompt 段落已被占用，插件整体不启用，不再谎报 armed）、`inbox already holds a pending turn-recovery nudge`（队列里已有一笔，未重复投递）、`turn/start not observed`（热加载中途，不判定）、`NOT ours`（同来源但 id 对不上，已忽略；0.2.5 起不再因此清在途标记）、`LATE, from guardIds`（认领超时后才到，仍按补写回合处理）、`DISCARDED by host`（用户停止，补写被丢弃）、`is not an in-flight nudge`（丢弃事件里的 id 不是我们的在途补写）、`origin=… lastSource=… not in nudge sources`（来源闸门拦下的空回合，例如社交桥 / 纯 runtime-context / 纯 notice；0.2.7 起两个字段分开写）、`empty turn with no user/message at all`（整回合没有任何来源消息，默认不补写，见 `allowOriginless`）、`nudge LOST: agent disposed before delivery`（0.3.0：会话在补写落地前被销毁，不再"提前 flush"，计 `lost`）、`nudge LOST`（排上却没落地：定时器被替换、或截止时刻已过；`stats` 的 `lost` 与它对应）、`background producer namespace`（会话 id 落在 `backgroundSessionPatterns` 里，后台评审/巡检会话一律不补写）、`a tool concluded this turn`（工具有 `concludesTurn`，回合是被工具收尾的，例如取消计划评审）、`state file NOT owned by turn-recovery`（自定义状态文件属于别人，已拒绝写入/压缩）、`CONTRACT DRIFT`（宿主出现了未知的 `reason.kind`，每个 kind 只报一次）、`kind=… not in nudgeKinds`（该回合原因不在允许补写的集合里，例如 aborted / error）、`turn/start missing for turn N`（事件丢失但计数是干净的，仍会判定）、`SUSPICIOUS: turn=N`（判成非空却没有任何 assistant 消息，说明计数有回归）、`host api: …`（加载自检，`MISSING` 表示宿主接口对不上）、`a nudge is already awaiting claim`（上一笔还没被认领）、`skipped:in-flight`（本回合没排上，因为上一笔仍在途 —— 不算「已补过」）、`turn N already handled`（该回合确实排过或确实被限流）、`DROPPED: turn moved on`（定时器到点时会话已进入下一回合）、`stop chaining`（补写回合又空，按设计不再连环）、`budget exhausted`（本小时额度用完）、`guard ids compacted` / `budget compact skipped`（状态文件压缩结果）、`log rotate skipped: file does not look like`（`logFile` 配到了别的文件，拒绝轮转它）。
 
 ## 实现约束
 
@@ -143,7 +150,7 @@
   3. 而 `dsh-settings` 投影表单时**直接读** `schema.type` / `schema.dict` / `schema.meta.volatile`，没有上面那层判别保护 —— 一个形状不对的 `Config` 有可能让设置页报错。
   本包零依赖，装进 profile 后也解析不到 `schemastery`（更不能 import `@deepseek-ai/*`）。与其导出一个「在 A 路径像 schema、在 B 路径像垃圾」的对象，不如不导出，把校验放在加载期日志里：错了能看见，也不会让设置页崩。
 - 所有逻辑包在 try/catch 里：任何异常只写日志，不向上抛，不会拖垮宿主回合。
-- 宿主门槛 `engines.dsh = ">=0.2.1-rc.1 <0.3.0-0"`：本插件用到的宿主 API 在 `0.2.1-rc.1` / `rc.2` / `rc.3` / `rc.4` / `rc.5` 里实现完全一致（rc.3 / rc.4 / rc.5 的 `dsh-system-prompt` / `dsh-agent` / `dsh-session` / `dsh-agent-loop` / `dsh-app-boot` 的 `lib/index.js` sha256 逐字节相同），所以门槛只设到 rc.1。**不要写成 `>=0.2.1`**——semver 里预发布版本不满足不含预发布标识的同段范围，`0.2.1-rc.3` 对 `>=0.2.1` 判为 `false`，会连 rc 版本一起挡掉。上界必须写成 `<0.3.0-0`：宿主用 `semver` 的 `includePrerelease: true` 判定门槛，写成 `<0.3.0` 时 `0.3.0-alpha.1` / `0.3.0-beta.2` 都会被判为满足（实测 `semver.satisfies('0.3.0-alpha.1', '>=0.2.1-rc.1 <0.3.0', {includePrerelease:true}) === true`），插件会带着未验证的假设加载到下一主线；`-0` 是显式的预发布截断。`scripts/check-metadata.mjs` 会强制检查这个写法。门槛不满足时宿主会把整个 bundle 静默跳过（启动只留一行 `skipping profile bundle`）。
+- 宿主门槛 `engines.dsh = ">=0.2.1-rc.1 <0.4.0-0"`（0.2.6 起上界从 `<0.3.0-0` 放宽；0.3.0 已把正文与本行统一，**0.3.x 本身未实测**，只在 0.2.2-rc.5 上验证过）：本插件用到的宿主 API 在 `0.2.1-rc.1` / `rc.2` / `rc.3` / `rc.4` / `rc.5` 里实现完全一致（rc.3 / rc.4 / rc.5 的 `dsh-system-prompt` / `dsh-agent` / `dsh-session` / `dsh-agent-loop` / `dsh-app-boot` 的 `lib/index.js` sha256 逐字节相同），所以门槛只设到 rc.1。**不要写成 `>=0.2.1`**——semver 里预发布版本不满足不含预发布标识的同段范围，`0.2.1-rc.3` 对 `>=0.2.1` 判为 `false`，会连 rc 版本一起挡掉。上界必须带 `-0`：宿主用 `semver` 的 `includePrerelease: true` 判定门槛，写成 `<0.4.0` 时 `0.4.0-alpha.1` 也会被判为满足（实测 `semver.satisfies('0.3.0-alpha.1', '>=0.2.1-rc.1 <0.3.0', {includePrerelease:true}) === true`），插件会带着未验证的假设加载到下一主线；`-0` 是显式的预发布截断。`scripts/check-metadata.mjs` 会强制检查这个写法。门槛不满足时宿主会把整个 bundle 静默跳过（启动只留一行 `skipping profile bundle`）。
 - **升级宿主前请先看门槛**：`<0.4.0-0` 的上界（0.2.6 起从 `<0.3.0-0` 放宽）意味着宿主升到 0.4.0（含 `0.4.0-alpha*` / `0.4.0-beta*`）时本插件会**静默不加载**（`dsh-app-boot` 只往 stderr 写一行 `skipping profile bundle`）。0.2.5 的上界是 `<0.3.0-0`，所以 DSH 一升到 0.3.x 就会这样消失。请先看日志首行 `plugin activated: ... version=...` 与紧随其后的 `host api: ...` 自检行：没有它们就是没加载或没接上。跨 0.4 需要重新适配后再改上界。
 - `inject = ['systemPrompt']` 是 cordis 的**硬依赖**，不做「可选依赖」改造：本版本 `@deepseek-ai/cordis` 的 `Inject.resolve` 只接受「数组」或「name → config 映射」，没有 `required`/`optional` 语义；写成 `{ optional: [...] }` 会被当成「等一个叫 optional 的服务」，插件将永不激活。
 
@@ -168,8 +175,12 @@
 - **预算文件是不可信输入**：解析时会丢弃「晚于当前时钟 +5 分钟」的时间戳（否则 `now - t` 为负、该会话被永久判成预算耗尽），并且整份文件只在 1 MiB 以内整读、超过就只读尾部（避免配置写错指向几百 MB 的文件时同步阻塞宿主）。写入用 JSON 行（会话 id 含空格也不会被截断），压缩是「重读磁盘 + 临时文件原子替换」，不会覆盖另一个进程刚追加的行。
 - **多进程（桌面宿主 + 独立的 web/headless 宿主）**：各自一套内存态，`agent.inbox.nextTurn` 只对本进程可见。预算文件与补写 id 文件是共享的，因此限流大致成立，但「同一会话同时被两个宿主打开」仍可能各补一笔。同一会话请只用一个宿主。
 - **`dryRun` 不写预算文件**：判定链、日志、限流检查照走，但不投递、不记账，所以它只能证明「判定会发生」，不能用来验证限流是否生效（日志里的 `budgetUsed=n/max` 是当时的已用额度）。
-- **多宿主共用同一日志文件**：两个进程同时写同一路径时轮转可能失败，此时回退 `truncate(0)` 并记一条 `log rotate fell back to truncate`。
-- **生产环境仍未观测到真实补写（截至 2026-11-09 复核）**：本机 8 天日志里共 645 个 `turn/end`（`completed` 455 / `error` 165 / `aborted` 25），空回合 182 个 —— 其中 `error` 162、`aborted` 20、`completed` **0**，`nudge SCHEDULED` / `DELIVERED` 也仍是 0。也就是说：唯一要救的那一类（`completed` 却只剩零宽占位符）在本机一次都没发生，出现的全是 `steps=0` 的调用失败（162 次集中在 11-06 / 11-07 两天，属于上游故障；此时补写只会反复撞同一堵墙，所以按设计不补）。所有结论仍来自单测与 mock 复现。要闭合这一项，请在真机上临时设置 `dryRun: true`，等一次 `completed` 空回合，确认日志出现 `nudge DRY-RUN: would deliver`（判定链在生产成立），再关掉 `dryRun` 等真实投递 —— 这比直接开补写更安全：干跑不会多跑一轮模型。看 `stats:` 聚合行可以一眼判断当前处在哪种状态。
+- **多宿主共用同一日志文件**：两个进程同时写同一路径时 rename 可能失败。**0.3.0 起不再回退 `truncate(0)`** —— 那一刀会在「文件其实不是我们的」时把别人的日志清零且不可恢复；现在只记一条 `log rotate skipped (rename failed, will retry next check)`，让日志继续长、下次检查再试。文件头校验也从「首字节是 `[`」收紧成「`[YYYY-` 形式的 ISO 时间戳」。
+- **0.3.0：`agent/disposed` 不再"提前 flush"**。0.2.7 在会话销毁前先把待发补写投出去，但 `send()` 对已销毁的 agent 依然不抛 —— 于是日志写 `DELIVERED`、`delivered` 计数 +1、预算被扣，消息却永久留在该会话的 `inbox.next-turn` 里无人认领（生产实证：`claimed` 恒为 0，两条消息跨宿主重启仍在队列）。现在改为明确记 `nudge LOST: agent disposed before delivery` 并计入 `stats.lost`：宁可少补一笔，也不伪造成功。一次性的后台会话本来就不该补写（见 `backgroundSessionPatterns`）。
+- **0.3.0：`foregroundKinds` 不再授予补写许可**。它只表示「谁的消息能取消一笔待发补写」。0.2.7 把它并进了放行集合，于是一个只想让社交桥取消补写的配置，顺手让桥接会话变成可补写 —— 模型输出经桥发给真人第三方。要放开补写只能用 `nudgeSources`。
+- **0.3.0：收尾指令是进程级 system prompt 段落**。`ctx.systemPrompt.section(...)` 注册进宿主 root layer（`dsh-system-prompt` 的 per-agent 覆盖要走 `agent.ctx`），因此即便 `sessionScope: 'root'` 把子代理排除在补写之外，子代理的 system prompt 仍然带着这段指令；`instructionText` 写非空时还会有一条 config issue 提示。插件没有 per-agent 注册入口，这一项只能明示、不能就地修复。
+- **0.2.5 起** `guard-ids.log` 超过 1 MiB 会按 TTL 原子压缩（`guard ids compacted: lines=N`），0.3.0 起压缩前另存一份 `.bak`、且文件首行带本插件标记（`{"plugin":"turn-recovery","v":1}`）；会话级记录也有 500 条上限。
+- **生产证据（2026-11-19 复核，DSH 0.2.2-rc.5 / 插件 0.2.7）**：`C:\Users\34332\.dsh\logs\turn-recovery.log` 1820 行里 `nudge SCHEDULED=9`、`nudge DELIVERED=5`、`guard message claimed=1`。第 9 次（`04:15:36.083Z` 排程、`04:15:36.989Z` 投递、`04:15:37.285Z` `guard message claimed turn=? matched=true`）发生在一次真实评审会话里，同一回合法出的正文随即出现 —— 这是**判定 → 投递 → 认领**三段在真机上第一次全部成立。同一份日志也暴露了 0.2.7 的两个缺陷：① 前 6 次排程全落在后台 `mnemon-r` 会话（它们是根会话、来源又写成 `source:{kind:'user'}`，两道闸门都放行），② 其中 2 次走 dispose 前的提前 flush，`send()` 不抛就记 `DELIVERED`，而消息永久留在死会话的 `inbox.next-turn` 里（`claimed` 长期为 0 就是这个原因）。0.3.0 分别用 `backgroundSessionPatterns` 与「dispose 只记 LOST」堵住。仍需注意：`turn=?` 说明认领事件的 `data.turn` 缺失，判定层取不到回合号 —— 不影响补写成立，但日志里少了这一项。
 
 ## License
 

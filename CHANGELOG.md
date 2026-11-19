@@ -7,6 +7,80 @@
 > `@nlflora/dsh-empty-turn-guard`）冲突，自 0.2.0 起更名为 `dsh-turn-recovery`。0.1.x 及更早的条目保留旧名原文，
 > 其提到的 `plugin:empty-turn-guard`、`empty-turn-guard.log` 等标识在 0.2.0 起分别改为 `plugin:turn-recovery`、`turn-recovery.log`。
 
+## [0.3.0] - 2026-11-19
+
+**评审缺陷修复版**。三专家评审（架构 / 安全 / 验收）在 DSH **0.2.2-rc.5** 上复核 0.2.7，
+并用 live `app.asar` 解出的 `dsh-desktop-runtime` 版本与宿主源码逐条核对契约。
+结论：判定层已在真机成立（首次观测到 `guard message claimed … matched=true`），
+但**投递路径会把补写送进正在销毁的会话**，另有两条配置组合会越权/毁数据。
+本版把评审列出的问题逐条修掉，测试 91 → 100 例。
+
+### 修复（阻断级）
+
+- **`agent/disposed` 提前 flush 把补写投进正在销毁的 agent（Blocker）**：
+  0.2.7 在 dispose 时调 `runNudge`，而 `deliver()` 仍能从注册表里找到这个 agent，
+  `send()` 不抛 → 记 `DELIVERED`、`delivered+1`、扣一小时预算、写 `guard-ids.log`，
+  下两行才 `in-flight cleared`。消息永久留在该会话 `inbox.next-turn`，
+  跨宿主重启都无人认领。生产实证：`2026-11-19T03:17:23.202Z DELIVERED` →
+  `.204Z FLUSH on agent dispose -> delivered` → `.204Z in-flight cleared (agent disposed)`，
+  两条消息（`590fce02…` / `c10a9137…`）至今仍在会话队列里，`claimed` 恒为 0。
+  现在：dispose 时**先摘注册表**、再清状态，待发补写改记
+  `nudge LOST: agent disposed before delivery` 并计入 `stats.lost`；
+  `deliver()` 另加存活闸（`disposedSessions` + `agent.disposed`），任何路径都不会再投给死会话。
+- **`foregroundKinds` 顺带授予了补写许可（Blocker，授权）**：
+  `allowedOrigins` 曾把 `foregroundKinds` 并进去，而这个配置的语义只是
+  「谁的消息能取消待发补写」。于是一个只想让社交桥取消补写的 profile，
+  会让桥接会话变成可补写 —— 模型输出经桥发给真人第三方，
+  正是 0.2.5 注释里写明「必须默认关掉」的未授权外部副作用。
+  现在放行集合只由 `DEFAULT_NUDGE_SOURCES ∪ nudgeSources` 构成。
+- **`budgetFile` / `logFile` 指向外部文件时会破坏对方数据（Blocker）**：
+  压缩判据是「能解析出 ≥1 行像预算记录的内容就算自己的」——
+  一个 1.1 MB 的外部 `audit.log`（NDJSON，恰好有一行 `{"id":…,"at":…}`）
+  被整份重写成 40 B，外部记录全丢，同目录还被创建 `guard-ids.log`。
+  现在：写入侧先落首行标记 `{"plugin":"turn-recovery","v":1}`；自定义路径若指向
+  「已存在且没有该标记」的文件，则**不写、不压缩、不备份**，只记一次
+  `state file NOT owned by turn-recovery`，预算退化为内存态。
+  `guard-ids.log` 也不再跟着外来目录落盘。
+- **日志轮转在 rename 失败时 `truncate(0)`（潜在，Windows 占用场景）**：
+  那一刀会在「文件其实不是我们的」时把别人日志清零且不可恢复。
+  现在只记 `log rotate skipped (rename failed, will retry next check)`；
+  文件头判据也从「首字节 `[`」收紧为 `[YYYY-MM-DDT`。
+
+### 修复（误判与语义）
+
+- **工具 `concludeTurn` 的回合被判空并补写**：`dsh-plan-mode` 在用户**取消**计划评审时
+  调 `exec.concludeTurn()`，回合以 `completed` 结束但最后一条助手消息只有 tool-call。
+  现在订阅 `tool/call` / `tool/result`：命中 `concludesTurn` 即不补写
+  （`nudgeSkipConcludedTurns`，默认开），另可用 `nudgeSkipTools` 指定工具名。
+- **后台生产者会话被当人类回合补写**：`dsh-mnemon` 用 `source:{kind:'user'}` 写入
+  一次性评审会话，宿主约定「非人类生产者必须自带 source」被它绕开。
+  新增 `backgroundSessionPatterns`（默认 `mnemon-run-` / `mnemon-review-` / `mnemon-idle-`），
+  命中即不补写；`[]` 可显式关闭。
+- **`interrupted` 不在 `KNOWN_TURN_KINDS`**：宿主 `TurnEndReasonMap` 有它
+  （crash-orphaned turn），旧版每次都误报 CONTRACT DRIFT。现加入已知集合，
+  仍默认不在 `nudgeKinds` 里（不补写）。
+- **日志 tag 8 位无法区分 `mnemon-run-v1` 与 `mnemon-review-v1`**（前 8 位都是
+  `mnemon-r`，评审时两位专家因此各指认不同会话却都能对上）。改为 12 位。
+
+### 变更
+
+- 跨进程 nudge 锁从全局单锁改为**按会话派生**（`nudge-<hash>.lock`），
+  不同会话不再互相阻塞；锁目录固定为插件 state 目录。
+- `guardIdHistory` 增加 500 会话上限；新增 `nudgeMessageId → sessionId` 反向索引，
+  使得 `stateById` 被 LRU 淘汰后「用户点停止」仍能定位在途补写。
+- 收尾指令是**进程级** system prompt（宿主 root layer），`sessionScope: 'root'`
+  不会让它避开子代理 —— 这不再是隐含行为：`instructionText` 非空时加载期记一条 config issue。
+- `budgetFile` 首行标记与压缩前 `.bak` 备份让状态文件可自证归属。
+- README 的 `engines` 上界说明与 `package.json` 统一为 `<0.4.0-0`，
+  并注明 0.3.x 未实测；`"nudgeKinds" is empty` 的提示语改为与默认值一致。
+
+### 测试
+
+`node test/guard.test.mjs` → **100 / 100 通过**。新增 9 例覆盖上列修复：
+`foregroundKinds` 不再授权、后台命名空间拒绝（含 `[]` 关闭）、
+工具 concludeTurn 与 `nudgeSkipTools`、外来 `budgetFile` 逐字节不变、
+日志 tag 12 位、`interrupted` 不报 drift、dispose 后不投递（两条路径）。
+
 ## [0.2.7] - 2026-11-18
 
 **补写链闭环版**。三专家评审（架构 / 安全 / 验收）在 DSH **0.2.2-rc.3** 上复核 0.2.6：
