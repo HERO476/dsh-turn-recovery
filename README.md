@@ -78,15 +78,26 @@
     backgroundSessionPatterns: [mnemon-run-, mnemon-review-, mnemon-idle-]  # 0.3.0：后台生产者
                              # 的会话 id 前缀，命中即不补写（它们用 source:{kind:'user'} 写入，
                              # 单看 source 分不出来）。[] = 关闭该拒绝
-    nudgeSkipTools: []       # 0.3.0：本回合调用过这些工具就不补写（如 exit_plan_mode）
-    nudgeSkipConcludedTurns: true  # 0.3.0：工具返回 concludesTurn 时回合是"被工具收尾"的，
-                             # 判空也不补写（计划评审被取消时就是这条路径）
+    nudgeSkipTools: [exit_plan_mode]  # 0.3.1：默认值含 exit_plan_mode —— 本回合调用过
+                             # 这些工具就跳过判空（tool/call.name 是 rc.5 事件里
+                             # **确实存在**的字段）。[] = 关掉默认白名单
+    nudgeSkipConcludedTurns: true  # 0.3.0 引入；**rc.5 上不触发**：宿主 4 处
+                             # append("tool/result") 的载荷都没有 concludesTurn，
+                             # 该标志只活在内部 ToolExecutionResult 上，不进 session 事件。
+                             # 保留窄读取，等宿主把它带回事件里才自动生效
     budgetFile: ''           # 空 = <DSH_HOME>/state/turn-recovery/nudges.log（跨重启限流）
-                             # 必须 .log 结尾。0.3.0 起：若指向**已存在且不属于本插件**的文件
-                             # （首行不是本插件标记），插件不写、不压缩、不备份，只记一次告警
-    logFile: ''              # 空 = <DSH_HOME>/logs/turn-recovery.log
+                             # 必须 .log 结尾、不得含 ".." 穿越。0.3.0 起：若指向
+                             # **已存在且不属于本插件**的文件（首行不是标记、也不是
+                             # {sid,id,at} 形状），插件不写、不压缩、不备份，只记一次告警
+    logFile: ''              # 空 = <DSH_HOME>/logs/turn-recovery.log；0.3.1 起追加侧也会
+                             # 做归属校验：指向别人的 .log 时回落默认路径，一个字节都不写
     logTurns: empty          # empty = 只记空回合/被跳过判定的回合；all = 连正常回合也记
     dryRun: false            # true = 判定/限流/日志全部照走，但不真的投递（验证用）
+    allowExternalState: true # 0.3.1：绝对路径的 logFile/budgetFile 是否允许落在 DSH_HOME 外。
+                             # 默认放行（把日志放收集目录是合法用法）；".." 穿越一律拒绝。
+                             # 设 false 则强制钉在 DSH_HOME 内
+    verifyPromptSection: true  # 0.3.1：arm 后延迟读一次装配结果，段落被 complete:true
+                             # 吞掉时打 CONTRACT DRIFT（见「已知限制」）
 ```
 
 配置做严格解析：`maxNudgesPerHour: 0` 是**关闭补写**，不会被默认值吞成 3；`delayMs: "abc"` 这类非法值回落到默认值；`enabled: "false"`（字符串）与 `false` 等价。布尔键只承认 `true/false/1/0/on/off/yes/no`，`enabled: "flase"` 这类拼错会被记成 config issue（行为仍按真值走，所以要留意日志）。
@@ -150,7 +161,7 @@
   3. 而 `dsh-settings` 投影表单时**直接读** `schema.type` / `schema.dict` / `schema.meta.volatile`，没有上面那层判别保护 —— 一个形状不对的 `Config` 有可能让设置页报错。
   本包零依赖，装进 profile 后也解析不到 `schemastery`（更不能 import `@deepseek-ai/*`）。与其导出一个「在 A 路径像 schema、在 B 路径像垃圾」的对象，不如不导出，把校验放在加载期日志里：错了能看见，也不会让设置页崩。
 - 所有逻辑包在 try/catch 里：任何异常只写日志，不向上抛，不会拖垮宿主回合。
-- 宿主门槛 `engines.dsh = ">=0.2.1-rc.1 <0.4.0-0"`（0.2.6 起上界从 `<0.3.0-0` 放宽；0.3.0 已把正文与本行统一，**0.3.x 本身未实测**，只在 0.2.2-rc.5 上验证过）：本插件用到的宿主 API 在 `0.2.1-rc.1` / `rc.2` / `rc.3` / `rc.4` / `rc.5` 里实现完全一致（rc.3 / rc.4 / rc.5 的 `dsh-system-prompt` / `dsh-agent` / `dsh-session` / `dsh-agent-loop` / `dsh-app-boot` 的 `lib/index.js` sha256 逐字节相同），所以门槛只设到 rc.1。**不要写成 `>=0.2.1`**——semver 里预发布版本不满足不含预发布标识的同段范围，`0.2.1-rc.3` 对 `>=0.2.1` 判为 `false`，会连 rc 版本一起挡掉。上界必须带 `-0`：宿主用 `semver` 的 `includePrerelease: true` 判定门槛，写成 `<0.4.0` 时 `0.4.0-alpha.1` 也会被判为满足（实测 `semver.satisfies('0.3.0-alpha.1', '>=0.2.1-rc.1 <0.3.0', {includePrerelease:true}) === true`），插件会带着未验证的假设加载到下一主线；`-0` 是显式的预发布截断。`scripts/check-metadata.mjs` 会强制检查这个写法。门槛不满足时宿主会把整个 bundle 静默跳过（启动只留一行 `skipping profile bundle`）。
+- 宿主门槛 `engines.dsh = ">=0.2.1-rc.1 <0.4.0-0"`（0.2.6 起上界从 `<0.3.0-0` 放宽；0.3.0 已把正文与本行统一，**0.3.x 本身未实测**，只在 0.2.2-rc.5 上验证过）：本插件用到的宿主 API 在 `0.2.1-rc.1` / `rc.2` / `rc.3` / `rc.4` / `rc.5` 里实现完全一致（rc.3 / rc.4 / rc.5 的 `dsh-system-prompt` / `dsh-agent` / `dsh-session` / `dsh-agent-loop` / `dsh-app-boot` 的 `lib/index.js` sha256 逐字节相同），所以门槛只设到 rc.1。**不要写成 `>=0.2.1`**——semver 里预发布版本不满足不含预发布标识的同段范围，`0.2.1-rc.3` 对 `>=0.2.1` 判为 `false`，会连 rc 版本一起挡掉。上界必须带 `-0`：宿主用 `semver` 的 `includePrerelease: true` 判定门槛，写成 `<0.4.0` 时 `0.4.0-alpha.1` 也会被判为满足（实测 `semver.satisfies('0.3.0-alpha.1', '>=0.2.1-rc.1 <0.3.0', {includePrerelease:true}) === true`），插件会带着未验证的假设加载到下一主线；`-0` 是显式的预发布截断。`scripts/check-metadata.mjs` 会强制检查这个写法。门槛不满足时宿主会把整个 bundle 静默跳过（启动只留一行 `skipping profile bundle`）。**0.3.1 起另有一道运行期兜底**：`agent` 生命周期 / `agent/inbox/discarded` / `session/event` 任一订阅失败都记入 `contractIssues`，arm 时直接 `guard NOT armed (fail-closed: host contract missing -> …)`，不再"看起来在跑、实际上撤不掉补写"。
 - **升级宿主前请先看门槛**：`<0.4.0-0` 的上界（0.2.6 起从 `<0.3.0-0` 放宽）意味着宿主升到 0.4.0（含 `0.4.0-alpha*` / `0.4.0-beta*`）时本插件会**静默不加载**（`dsh-app-boot` 只往 stderr 写一行 `skipping profile bundle`）。0.2.5 的上界是 `<0.3.0-0`，所以 DSH 一升到 0.3.x 就会这样消失。请先看日志首行 `plugin activated: ... version=...` 与紧随其后的 `host api: ...` 自检行：没有它们就是没加载或没接上。跨 0.4 需要重新适配后再改上界。
 - `inject = ['systemPrompt']` 是 cordis 的**硬依赖**，不做「可选依赖」改造：本版本 `@deepseek-ai/cordis` 的 `Inject.resolve` 只接受「数组」或「name → config 映射」，没有 `required`/`optional` 语义；写成 `{ optional: [...] }` 会被当成「等一个叫 optional 的服务」，插件将永不激活。
 
@@ -178,9 +189,12 @@
 - **多宿主共用同一日志文件**：两个进程同时写同一路径时 rename 可能失败。**0.3.0 起不再回退 `truncate(0)`** —— 那一刀会在「文件其实不是我们的」时把别人的日志清零且不可恢复；现在只记一条 `log rotate skipped (rename failed, will retry next check)`，让日志继续长、下次检查再试。文件头校验也从「首字节是 `[`」收紧成「`[YYYY-` 形式的 ISO 时间戳」。
 - **0.3.0：`agent/disposed` 不再"提前 flush"**。0.2.7 在会话销毁前先把待发补写投出去，但 `send()` 对已销毁的 agent 依然不抛 —— 于是日志写 `DELIVERED`、`delivered` 计数 +1、预算被扣，消息却永久留在该会话的 `inbox.next-turn` 里无人认领（生产实证：`claimed` 恒为 0，两条消息跨宿主重启仍在队列）。现在改为明确记 `nudge LOST: agent disposed before delivery` 并计入 `stats.lost`：宁可少补一笔，也不伪造成功。一次性的后台会话本来就不该补写（见 `backgroundSessionPatterns`）。
 - **0.3.0：`foregroundKinds` 不再授予补写许可**。它只表示「谁的消息能取消一笔待发补写」。0.2.7 把它并进了放行集合，于是一个只想让社交桥取消补写的配置，顺手让桥接会话变成可补写 —— 模型输出经桥发给真人第三方。要放开补写只能用 `nudgeSources`。
-- **0.3.0：收尾指令是进程级 system prompt 段落**。`ctx.systemPrompt.section(...)` 注册进宿主 root layer（`dsh-system-prompt` 的 per-agent 覆盖要走 `agent.ctx`），因此即便 `sessionScope: 'root'` 把子代理排除在补写之外，子代理的 system prompt 仍然带着这段指令；`instructionText` 写非空时还会有一条 config issue 提示。插件没有 per-agent 注册入口，这一项只能明示、不能就地修复。
+- **0.3.0：收尾指令是进程级 system prompt 段落**。`ctx.systemPrompt.section(...)` 注册进宿主 root layer（`dsh-system-prompt` 的 per-agent 覆盖要走 `agent.ctx`），因此即便 `sessionScope: 'root'` 把子代理排除在补写之外，子代理的 system prompt 仍然带着这段指令；`instructionText` 写非空时还会有一条 config issue 提示。插件没有 per-agent 注册入口，这一项只能明示、不能就地修复。0.3.1 起无论指令是默认文本还是自定义文本，加载时都会打一行 `note: closing instruction is process-wide …`（它不进 `configIssues` 计数，免得把真正的配置错误淹没）。
+- **0.3.1：`nudgeSources` / `allowedOrigins` 不是安全边界**。闸门读的是生产者**自报**的 `source.kind`，宿主侧没有认证（`dsh-llm` 的 message.ts 注明 source 由生产者提供，`agent.send()` 也没有鉴权）。任何同进程插件都能把消息写成 `source:{kind:'user'}`。真正硬一点的判据只有 `backgroundSessionPatterns`（会话 id 命名空间由生产者固定）。要防越权，两个一起维护。
+- **0.3.1：`complete: true` 段落会让收尾指令静默消失**。宿主 `dsh-system-prompt` 的 `assemble()` 在存在 complete section 时只返回 `[completeSection, …]`，其它段落整段丢弃（本机的 dsh-purge 补丁只保留 `dsh-purge*` 前缀，救不了本插件）。段落"注册成功"与"会出现在 prompt 里"是两件事，所以 arm 之后会延迟读一次装配结果，缺段就打 `CONTRACT DRIFT: prompt section "turn-recovery" is absent from the assembled prompt`。看到这一行说明该 preset 下收尾指令没生效 —— 换 preset 或让 preset 别用 `complete: true`。
+- **0.3.1：投递链的真机证据仍然薄弱**。生产日志（2026-11-20 复核，1917 行）里 `nudge SCHEDULED=16`、`nudge DELIVERED=12`、`guard message claimed=1`；12 次投递中 9 次是后台 `mnemon-*` 会话（0.3.0 之前没有命名空间拒绝）、2 次是复现测试，**只有 1 次是真实人类会话且它被认领了**。0.3.0 上台后 6 次激活、4 次 `stats` 全为 `scheduled=0`（那段时间没有命中目标的空回合）。所以「判定层可用」有充分证据，「投递链可用」目前只有 n=1 的样本，发布说明不得写成"已验证"。
 - **0.2.5 起** `guard-ids.log` 超过 1 MiB 会按 TTL 原子压缩（`guard ids compacted: lines=N`），0.3.0 起压缩前另存一份 `.bak`、且文件首行带本插件标记（`{"plugin":"turn-recovery","v":1}`）；会话级记录也有 500 条上限。
-- **生产证据（2026-11-19 复核，DSH 0.2.2-rc.5 / 插件 0.2.7）**：`C:\Users\34332\.dsh\logs\turn-recovery.log` 1820 行里 `nudge SCHEDULED=9`、`nudge DELIVERED=5`、`guard message claimed=1`。第 9 次（`04:15:36.083Z` 排程、`04:15:36.989Z` 投递、`04:15:37.285Z` `guard message claimed turn=? matched=true`）发生在一次真实评审会话里，同一回合法出的正文随即出现 —— 这是**判定 → 投递 → 认领**三段在真机上第一次全部成立。同一份日志也暴露了 0.2.7 的两个缺陷：① 前 6 次排程全落在后台 `mnemon-r` 会话（它们是根会话、来源又写成 `source:{kind:'user'}`，两道闸门都放行），② 其中 2 次走 dispose 前的提前 flush，`send()` 不抛就记 `DELIVERED`，而消息永久留在死会话的 `inbox.next-turn` 里（`claimed` 长期为 0 就是这个原因）。0.3.0 分别用 `backgroundSessionPatterns` 与「dispose 只记 LOST」堵住。仍需注意：`turn=?` 说明认领事件的 `data.turn` 缺失，判定层取不到回合号 —— 不影响补写成立，但日志里少了这一项。
+- **生产证据（2026-11-19 复核，DSH 0.2.2-rc.5 / 插件 0.2.7）**：`C:\Users\34332\.dsh\logs\turn-recovery.log` 1820 行里 `nudge SCHEDULED=9`、`nudge DELIVERED=5`、`guard message claimed=1`。第 9 次（`04:15:36.083Z` 排程、`04:15:36.989Z` 投递、`04:15:37.285Z` `guard message claimed turn=? matched=true`）发生在一次真实评审会话里，同一回合法出的正文随即出现 —— 这是**判定 → 投递 → 认领**三段在真机上第一次全部成立。同一份日志也暴露了 0.2.7 的两个缺陷：① 前 6 次排程全落在后台 `mnemon-r` 会话（它们是根会话、来源又写成 `source:{kind:'user'}`，两道闸门都放行），② 其中 2 次走 dispose 前的提前 flush，`send()` 不抛就记 `DELIVERED`，而消息永久留在死会话的 `inbox.next-turn` 里（`claimed` 长期为 0 就是这个原因）。0.3.0 分别用 `backgroundSessionPatterns` 与「dispose 只记 LOST」堵住。**0.3.1 已修 `turn=?`**：认领事件的载荷就是消息本体（宿主 `session.append("user/message", message)`），没有顶层 `turn`，现在改用插件自己记下的 `lastNudgeTurn`，日志里能直接对上 `turn/end turn=N`。0.3.1 同时把第 ① 项的闸门提到 `sessionScope` 之前 —— 0.3.0 里配了 `sessionScope: 'all'` 就等于把这道拒绝整段短路。
 
 ## License
 

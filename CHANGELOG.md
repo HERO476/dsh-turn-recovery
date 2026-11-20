@@ -7,6 +7,86 @@
 > `@nlflora/dsh-empty-turn-guard`）冲突，自 0.2.0 起更名为 `dsh-turn-recovery`。0.1.x 及更早的条目保留旧名原文，
 > 其提到的 `plugin:empty-turn-guard`、`empty-turn-guard.log` 等标识在 0.2.0 起分别改为 `plugin:turn-recovery`、`turn-recovery.log`。
 
+## [0.3.1] - 2026-11-20
+
+**三方评审（架构 / 安全 / 验收）缺陷修复版**。在 DSH **0.2.2-rc.5**（本地补丁版）上复核
+0.3.0，结论是「判定层稳、投递层真机证据为零、且有一条发布说明与实际行为相反」。
+本版把评审列出的 P0/P1 逐条修掉，单测 100 → **112 例**。
+
+### 修复（阻断级）
+- **`concludesTurn` 通道在 rc.5 上不可达（发布说明与实际相反）**：
+  宿主全部 4 处 `append("tool/result")`（`dsh-tools/lib/pipeline.js`、
+  `lib/types/batch.js`、`dsh-agent-loop` 的恢复重放、`dsh-compaction-tool-result-pruner`）
+  写入的载荷都是 `{turn, step, message, error?, meta?}` —— `concludesTurn` 只活在内部的
+  `ToolExecutionResult` 上，**不进 session 事件**。于是 0.3.0 宣称修好的
+  「工具收尾不补写」在真机上恒不生效，而典型触发（用户取消计划评审）恰恰是
+  「用户刚收回回合，插件 900ms 后又唤醒模型」。
+  现在 `nudgeSkipTools` 默认 = `['exit_plan_mode']`，改用事件里**确实存在**的
+  `tool/call.name`；`nudgeSkipConcludedTurns` 保留窄读取，但注释与 README 已改为
+  「rc.5 不触发，等宿主把它带回事件里才自动生效」，不再当主防线。
+- **`guard-ids.log` 缺所有权校验**：`compactGuardIds()` 与 `recordGuardId()` 都没有
+  `stateFileOwned` 判定（budget 侧有），复现时一个 1.49 MB 的外部文件被整份重写成
+  195 B（30,000 条记录丢失 + 写 `.bak`）。现在两侧同构校验，不属于自己就只走内存去重。
+- **`sessionScope:'all'` 绕过后台生产者拒绝**：`sessionInScope()` 里
+  `if (cfg.sessionScope === 'all') return true;` 在 `backgroundSession()` 判断之前，
+  于是「照着 README 想让子代理也受保护」等于把 0.3.0 刚加的闸门整段短路
+  （探针：同一条 `mnemon-review-*` 会话，`scope='all'` → sent=1，默认 `'root'` → sent=0）。
+  命名空间拒绝现在提到 scope 开关之前，`sessionScope` 只管「子代理要不要纳入」。
+
+### 修复（误判与可观测性）
+- **`assistant/message.content` 非数组时把有正文的回合判成空**（假阳性补写）：
+  `inspectMessage()` 现在把字符串按一段 text 计，其他非数组形状回报 `malformed`
+  并打一行 `SUSPICIOUS`。
+- **认领日志的 `turn=` 恒为 `?`**：宿主 `append("user/message", message)` 的载荷是
+  **消息本体**，没有顶层 `turn`。改用插件自己记下的 `lastNudgeTurn`
+  （生产日志实证：`guard message claimed turn=? matched=true [debe6bf6]`）。
+- **收尾指令被 `complete:true` 段落静默吞掉**：arm 之后延迟一拍只读
+  `systemPrompt.assemble()`，装配结果里没有本段就打
+  `CONTRACT DRIFT: prompt section "turn-recovery" is absent…`。
+  可用 `verifyPromptSection:false` 关掉。
+- **默认指令的进程级生效从不提示**：新增一行启动 `note:`（不进 `configIssues` 计数，
+  避免把真正的配置错误淹没）。
+- **`guard-ids.log` 的首行标记不追溯**：0.2.x 创建的老文件首行是 `{"sid","id","at"}`，
+  没有 `OWN_MARK`，只认标记会把「自己的老文件」判成外来文件。现在补一条形状判据。
+
+### 加固
+- **宿主契约缺失时 fail-closed**：`agent` 生命周期 / `agent/inbox/discarded` /
+  `session/event` 任一订阅失败都记入 `contractIssues`，arm 时**不 arm** 并写
+  `guard NOT armed (fail-closed: host contract missing -> …)`。
+  旧版只写一行日志然后照常 arm —— 插件看起来在跑，实际上「用户点停止撤不掉补写」。
+- **自定义 `logFile` 的追加侧补归属校验**：此前只有轮转侧有 `looksLikeOurLog`，
+  追加侧会把本插件记录持续写进别人的 `.log`。现在首次写入前判定，不属于自己就
+  回落默认路径。
+- **路径穿越拒绝**：`logFile` / `budgetFile` 含 `..` 段直接回落默认并记 config issue
+  （判定用原始字符串，不做 normalize —— normalize 正好会抹掉要拦的东西）。
+  绝对路径仍是显式意图，`allowExternalState:false` 才强制钉在 `DSH_HOME` 内。
+- **兜底日志带 pid**：`$TMP/turn-recovery-<pid>.log`，避免 POSIX 共享 /tmp 下被预置
+  同名符号链接把日志行引到别处。
+- **日志加 `profile=` 归因**：desktop 与 headless 都挂本插件、又写同一份日志，
+  仅凭 pid 无法判断某行来自哪个环境。
+- **段落 disposer 双重注册**：宿主 `section()` 返回的 disposer 内部已是
+  `layers.effect(this.ctx, …)`，插件侧不再用 `ctx.effect` 包第二层。
+- **发布门加一致性检查**：`check-metadata.mjs` 比对源码与已加载副本
+  （`DSH_PLUGIN_INSTALL_DIR` 或 `~/.dsh/plugins/<name>`）的 7 个文件 SHA-256。
+
+### 测试
+`node test/guard.test.mjs` → **112 / 112 通过**。新增 12 例覆盖本版每条修复：
+`sessionScope:'all'` 不得越权、外部 guard-ids.log 逐字节不变、
+默认白名单与 `[]` 关闭、认领 turn 号可解析、字符串 content 不误判、
+`complete:true` 的 CONTRACT DRIFT（正反两例）、订阅失败不 arm、路径穿越回落、
+外部 logFile 不追加、启动 note 行。
+
+### 已知未验证（如实记录）
+- 真机 E2E「scheduled → delivered → claimed」在 0.3.x 仍**零成功证据**：
+  生产日志里 `claimed` 全历史仅 1 次（`turn=?`，已由本版修好关联键）。
+  0.3.0 上台后 6 次激活、4 次 `stats` 全为 `scheduled=0`（期间没有命中目标的空回合），
+  所以「投递链可用」这句话目前只有 n=1 的样本支撑，发布说明不得声称已验证。
+- 0.3.x / 0.4.x 宿主不存在（npm 最新即 0.2.2-rc.5），`engines.dsh` 上界仍是
+  `<0.4.0-0`（推断风险，已由 fail-closed 契约断言兜底）。
+- rc.3 / rc.4 未实装；三版 API 等价是「5–7 个宿主管包逐字节相同」的等价推断。
+- `nudgeSources` / `allowedOrigins` 读的是生产者自报的 `source.kind`，宿主侧无认证，
+  **不是安全边界**（见 README「已知限制」）。
+
 ## [0.3.0] - 2026-11-19
 
 **评审缺陷修复版**。三专家评审（架构 / 安全 / 验收）在 DSH **0.2.2-rc.5** 上复核 0.2.7，

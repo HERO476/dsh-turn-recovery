@@ -82,6 +82,51 @@ try {
   fail('无法 import 插件入口：' + err.message);
 }
 
+/**
+ * 3) 源码 ↔ 已加载副本一致性（0.3.1，评审 A-3）。
+ *
+ * 本插件的实际运行路径是 profile 里的 `link:C:/…/.dsh/plugins/dsh-turn-recovery`，
+ * 和工作副本（D:\…）不是同一个目录，两份靠手工同步。于是「npm test 全绿」
+ * 证明的是工作副本，而宿主加载的是另一份 —— 历史故障里出现过版本漂移。
+ * 这里逐文件比对内容哈希，不一致就 fail。
+ *
+ * 副本路径：优先 env DSH_PLUGIN_INSTALL_DIR，其次 ~/.dsh/plugins/<name>。
+ * 副本不存在（CI / 干净 clone）时跳过，只打一行提示。
+ */
+const COMPARED = [
+  'package.json', 'cordis.patch.yml', 'lib/index.js',
+  'test/guard.test.mjs', 'scripts/check-metadata.mjs', 'README.md', 'CHANGELOG.md',
+];
+try {
+  const { createHash } = await import('node:crypto');
+  const os = await import('node:os');
+  const installed = process.env.DSH_PLUGIN_INSTALL_DIR
+    || path.join(os.homedir(), '.dsh', 'plugins', pkg.name);
+  if (fs.existsSync(installed)) {
+    const sha = (file) => createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+    let compared = 0;
+    for (const rel of COMPARED) {
+      const a = path.join(root, rel);
+      const b = path.join(installed, rel);
+      if (!fs.existsSync(a) || !fs.existsSync(b)) {
+        fail('已加载副本缺文件：' + path.join(pkg.name, rel) + '（' + installed + '）');
+        continue;
+      }
+      compared += 1;
+      if (sha(a) !== sha(b)) {
+        fail('源码与已加载副本内容不一致：' + rel + '（' + installed + '）—— 先同步再发布');
+      }
+    }
+    if (compared > 0 && errors.length === 0) {
+      console.log('一致性检查：源码与已加载副本 ' + compared + ' 个文件哈希一致（' + installed + '）。');
+    }
+  } else {
+    console.log('一致性检查：跳过（未找到已加载副本 ' + installed + '）。');
+  }
+} catch (err) {
+  fail('一致性检查执行失败：' + err.message);
+}
+
 if (errors.length > 0) {
   console.error('发布前检查失败（' + errors.length + ' 项）：\n');
   for (const e of errors) console.error('  - ' + e);

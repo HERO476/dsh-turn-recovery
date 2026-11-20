@@ -56,8 +56,18 @@ function makeRig(config = {}, registryAgents = []) {
         sections.push(opts);
         return () => {};
       },
+      // 0.3.1（评审 A-1）：arm 之后要读一次装配结果。默认回显已注册段落；
+      // 传 __assemble 可模拟「complete:true 段落把其它段整段吞掉」的宿主行为。
+      assemble: (input) => (typeof config.__assemble === 'function'
+        ? config.__assemble(input, sections)
+        : { sections: sections.map((s) => ({ ...s })) }),
     },
-    on: (event, fn) => { handlers.set(event, fn); },
+    on: (event, fn) => {
+      if (typeof config.__onThrows === 'function' && config.__onThrows(event)) {
+        throw new Error('subscription boom: ' + event);
+      }
+      handlers.set(event, fn);
+    },
     effect: (fn) => { effects.push(fn); },
     get: (service) => (service === 'agents' ? { list: () => registryAgents } : undefined),
   };
@@ -1646,6 +1656,191 @@ test('0.3.0：宿主 interrupted（崩溃遗留回合）不再误报 CONTRACT DR
   await sleep(40);
   assert.doesNotMatch(rig.log(), /CONTRACT DRIFT/);
   assert.equal(rig.sent.length, 0, 'interrupted is not in nudgeKinds by default');
+  rig.cleanup();
+});
+
+test('0.3.1（S1）：sessionScope:"all" 不得绕过后台生产者命名空间拒绝', async () => {
+  // 0.3.0 把 backgroundSession 判断写在 `sessionScope === 'all'` 之后，
+  // 于是「照着 README 想让子代理也受保护」等于把这条闸门整段短路：
+  // mnemon-review-* 的自动化会话会被当成人类回合补写。
+  const rig = makeRig({ delayMs: 5, sessionScope: 'all', __sessionId: 'mnemon-review-v1-cccc3333' });
+  rig.fire('turn/start', { turn: 20 });
+  rig.fire('user/message', human());
+  rig.fire('assistant/message', { turn: 20, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 20, reason: { kind: 'completed' } });
+  await sleep(50);
+  assert.equal(rig.sent.length, 0, 'background producer session must never be nudged');
+  assert.match(rig.log(), /background producer namespace/);
+  rig.cleanup();
+});
+
+test('0.3.1（S2）：自定义目录下别人的 guard-ids.log 一个字节都不动', async () => {
+  const prevHome = process.env.DSH_HOME;
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'etg-home-' + process.pid + '-'));
+  process.env.DSH_HOME = home;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'etg-guard-' + process.pid + '-'));
+  // 预算文件是「我们自己的」（带 OWN_MARK）→ guardPath 会指向同目录，
+  // 而那个 guard-ids.log 是外人写的：不是 OWN_MARK，也不是 {sid,id,at} 形状。
+  const budget = path.join(dir, 'nudges.log');
+  fs.writeFileSync(budget, '{"plugin":"turn-recovery","v":1}\n');
+  const guard = path.join(dir, 'guard-ids.log');
+  const filler = [];
+  for (let i = 0; i < 6000; i += 1) filler.push(JSON.stringify({ id: 'foreign-' + i, at: Date.now() }));
+  const body = filler.join('\n') + '\n';
+  fs.writeFileSync(guard, body);
+  const before = fs.statSync(guard).size;
+  try {
+    const rig = makeRig({ delayMs: 5, budgetFile: budget });
+    rig.fire('turn/start', { turn: 21 });
+    rig.fire('user/message', human());
+    rig.fire('assistant/message', { turn: 21, step: 1, message: assistant(ZW) });
+    rig.fire('turn/end', { turn: 21, reason: { kind: 'completed' } });
+    await sleep(60);
+    assert.equal(rig.sent.length, 1, 'nudging itself still works');
+    assert.equal(fs.statSync(guard).size, before, 'foreign guard-ids.log must stay byte-identical');
+    assert.equal(fs.readFileSync(guard, 'utf8'), body);
+    assert.equal(fs.existsSync(guard + '.bak'), false, 'must not back up a foreign file');
+    assert.match(rig.log(), /NOT owned by turn-recovery/);
+    rig.cleanup();
+  } finally {
+    if (prevHome === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = prevHome;
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('0.3.1（B1）：nudgeSkipTools 默认含 exit_plan_mode —— 不配也不补写', async () => {
+  // 0.3.0 依赖的 concludesTurn 事件通道在 rc.5 不可达，默认白名单是主防线。
+  const rig = makeRig({ delayMs: 5 });
+  rig.fire('turn/start', { turn: 22 });
+  rig.fire('user/message', human());
+  rig.fire('tool/call', { turn: 22, step: 1, callId: 'c1', name: 'exit_plan_mode', arguments: {} });
+  rig.fire('tool/result', { turn: 22, step: 1, message: { role: 'tool' } });
+  rig.fire('assistant/message', { turn: 22, step: 2, message: assistant(null, true) });
+  rig.fire('turn/end', { turn: 22, reason: { kind: 'completed' } });
+  await sleep(50);
+  assert.equal(rig.sent.length, 0, 'exit_plan_mode is in the default skip list');
+  assert.match(rig.log(), /is in nudgeSkipTools/);
+  rig.cleanup();
+});
+
+test('0.3.1（B1）：显式 nudgeSkipTools: [] 关掉默认白名单', async () => {
+  const rig = makeRig({ delayMs: 5, nudgeSkipTools: [] });
+  rig.fire('turn/start', { turn: 23 });
+  rig.fire('user/message', human());
+  rig.fire('tool/call', { turn: 23, step: 1, callId: 'c2', name: 'exit_plan_mode', arguments: {} });
+  rig.fire('assistant/message', { turn: 23, step: 2, message: assistant(null, true) });
+  rig.fire('turn/end', { turn: 23, reason: { kind: 'completed' } });
+  await sleep(50);
+  assert.equal(rig.sent.length, 1, 'empty list must disable the default whitelist');
+  rig.cleanup();
+});
+
+test('0.3.1（A-5）：认领日志的 turn 号不再恒为 "?"', async () => {
+  const rig = makeRig({ delayMs: 5 });
+  rig.fire('turn/start', { turn: 24 });
+  rig.fire('user/message', human());
+  rig.fire('assistant/message', { turn: 24, step: 1, message: assistant(ZW) });
+  rig.fire('turn/end', { turn: 24, reason: { kind: 'completed' } });
+  await sleep(30);
+  assert.equal(rig.sent.length, 1);
+  // 宿主认领时 append 的是消息本体：载荷里**没有** turn 字段。
+  rig.fire('user/message', guardClaim(lastSentId(rig)));
+  await sleep(20);
+  assert.match(rig.log(), /guard message claimed turn=24 /);
+  assert.doesNotMatch(rig.log(), /guard message claimed turn=\?/);
+  rig.cleanup();
+});
+
+test('0.3.1（R2）：assistant content 是字符串时按有正文处理，不补写', async () => {
+  const rig = makeRig({ delayMs: 5 });
+  rig.fire('turn/start', { turn: 25 });
+  rig.fire('user/message', human());
+  rig.fire('assistant/message', { turn: 25, step: 1, message: { role: 'assistant', content: '这里有正文' } });
+  rig.fire('turn/end', { turn: 25, reason: { kind: 'completed' } });
+  await sleep(50);
+  assert.equal(rig.sent.length, 0, 'string content must count as visible text');
+  rig.cleanup();
+});
+
+test('0.3.1（A-1）：complete:true 段落吞掉本段时打 CONTRACT DRIFT', async () => {
+  const rig = makeRig({
+    delayMs: 5,
+    __assemble: () => ({ sections: [{ name: 'persona', complete: true, text: 'only me' }] }),
+  });
+  await sleep(480);
+  assert.match(rig.log(), /CONTRACT DRIFT: prompt section "turn-recovery" is absent/);
+  rig.cleanup();
+});
+
+test('0.3.1（A-1）：正常装配时不误报 CONTRACT DRIFT', async () => {
+  const rig = makeRig({ delayMs: 5 });
+  await sleep(480);
+  assert.doesNotMatch(rig.log(), /prompt section "turn-recovery" is absent/);
+  rig.cleanup();
+});
+
+test('0.3.1（A-2）：宿主订阅失败 → fail-closed，不 arm', async () => {
+  const rig = makeRig({ delayMs: 5, __onThrows: (event) => event === 'agent/created' });
+  await sleep(40);
+  assert.match(rig.log(), /guard NOT armed \(fail-closed: host contract missing/);
+  assert.doesNotMatch(rig.log(), /guard armed/);
+  rig.fire && rig.fire('turn/start', { turn: 26 });
+  rig.fire('turn/end', { turn: 26, reason: { kind: 'completed' } });
+  await sleep(40);
+  assert.equal(rig.sent.length, 0, 'an unarmed guard must never deliver');
+  rig.cleanup();
+});
+
+test('0.3.1（S5）：logFile 含 ".." 穿越 → 回落默认路径', async () => {
+  const prev = process.env.DSH_HOME;
+  const home = path.join(os.tmpdir(), 'etg-home-' + process.pid + '-' + (++seq));
+  process.env.DSH_HOME = home;
+  try {
+    // 注意：必须用字符串拼接构造路径 —— path.join(home,'..','x.log') 会先把 ".."
+    // 规范化掉，正好把要测的东西抹掉。
+    const evil = home + path.sep + '..' + path.sep + 'etg-evil.log';
+    const rig = makeRig({ delayMs: 5, __skipCreate: true, logFile: evil });
+    const fallback = path.join(home, 'logs', 'turn-recovery.log');
+    assert.ok(fs.existsSync(fallback), 'falls back to DSH_HOME');
+    const text = fs.readFileSync(fallback, 'utf8');
+    assert.match(text, /contains a "\.\." segment -> default used/);
+    assert.equal(fs.existsSync(evil), false, 'must not create the evil path');
+    rig.cleanup();
+  } finally {
+    if (prev === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = prev;
+    try { fs.rmSync(home, { recursive: true, force: true }); } catch {}
+  }
+});
+
+test('0.3.1（A-4）：logFile 指向别人的 .log → 不追加，回落默认路径', async () => {
+  const prev = process.env.DSH_HOME;
+  const home = path.join(os.tmpdir(), 'etg-home-' + process.pid + '-' + (++seq));
+  process.env.DSH_HOME = home;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'etg-log-' + process.pid + '-'));
+  const foreign = path.join(dir, 'audit.log');
+  const body = 'not our log format\nline two\n';
+  fs.writeFileSync(foreign, body);
+  try {
+    const rig = makeRig({ delayMs: 5, __skipCreate: true, logFile: foreign });
+    const fallback = path.join(home, 'logs', 'turn-recovery.log');
+    assert.equal(fs.readFileSync(foreign, 'utf8'), body, 'foreign log must stay byte-identical');
+    assert.match(fs.readFileSync(fallback, 'utf8'), /log file NOT owned by turn-recovery/);
+    rig.cleanup();
+  } finally {
+    if (prev === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = prev;
+    fs.rmSync(dir, { recursive: true, force: true });
+    try { fs.rmSync(home, { recursive: true, force: true }); } catch {}
+  }
+});
+
+test('0.3.1（A-8）：默认指令的进程级生效在启动日志里说明', async () => {
+  const rig = makeRig({ delayMs: 5, __skipCreate: true });
+  assert.match(rig.log(), /closing instruction is process-wide \(also reaches subagents\) \[built-in default text\]/);
+  assert.match(rig.log(), /profile=/);
   rig.cleanup();
 });
 
